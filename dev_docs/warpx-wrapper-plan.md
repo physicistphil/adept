@@ -133,9 +133,13 @@ payoff, but start the 1:1 with the **collisionless** pair to isolate PIC-core pa
 - **M1 — wrapper skeleton** (core): `adept/warpx/` deck+runner+base, `solver: warpx`
   registry, two-stream-style smoke deck, tests (self-skipping without binary), CI
   paths filter. Runs end-to-end on Perlmutter inside an allocation, logs to MLflow.
-  **Code DONE 2026-08-14** (deck/runner/base/post + registry + tests + CI + docs;
-  `WarpxLPI` pass-through stub + smoke campaign in warpx-lpi). Remaining: the live
-  end-to-end run on Perlmutter.
+  **DONE 2026-08-14** (deck/runner/base/post + registry + tests + CI + docs;
+  `WarpxLPI` pass-through stub + smoke campaign in warpx-lpi). Live end-to-end run
+  verified on a Perlmutter debug-QOS GPU node (job 56960877, binary
+  `build_pm_gpu/bin/warpx.1d`): 100 steps in 0.57 s, zero WarpX warnings, openPMD
+  h5 dumps + FieldEnergy/ParticleEnergy reduced diags on disk, MLflow exp
+  `warpx-lpi-smoke` (188980) run FINISHED with wall_time_s/exit_code/final_step
+  metrics and inputs/warpx_used_inputs/reducedfiles/units.yaml artifacts.
 - **M2 — io + general plots**: openPMD→NetCDF layer, units (SI→normalized), general
   canned plots (spacetime, lineouts, ω–k, energy traces), `regen`. Reduced-diag
   parsers land here.
