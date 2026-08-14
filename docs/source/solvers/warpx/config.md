@@ -1,0 +1,91 @@
+# WarpX Configuration Reference
+
+This document describes how to construct a configuration file for the `warpx` solver — and how
+that YAML manifest relates to the native WarpX inputs file it wraps.
+
+Like the OSIRIS wrapper (and unlike the native adept solvers), the WarpX wrapper does not define
+the physics in YAML. The **native WarpX inputs file is the source of truth**: the manifest points
+at an inputs file, optionally patches it with `overrides`, and configures how the run is executed
+and logged. WarpX inputs are SI throughout and form a flat [AMReX ParmParse](https://warpx.readthedocs.io/en/latest/usage/parameters.html)
+namespace, so overrides are a flat `key: value` mapping rather than the OSIRIS section machinery.
+
+## Top-Level Structure
+
+```yaml
+solver: warpx           # required, dispatch key
+
+mlflow:
+  experiment: my-experiment   # required
+  run: my-run                 # required
+
+warpx:
+  deck: decks/srs-1d          # required — the native WarpX inputs file
+  reference_density: 9.05e21  # cm^-3; fixes the wp0/skin-depth normalization
+  binary: /path/to/warpx.1d   # optional, see binary resolution
+  mpi_ranks: 1
+  overrides:
+    amr.n_cell: 512
+```
+
+## warpx
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `deck` | string | Path to the native WarpX inputs file, repo-relative or absolute (required). This file is parsed, optionally patched by `overrides`, re-rendered to `inputs` in the run directory, and every key is logged to MLflow. |
+| `reference_density` | string \| float | Physical reference density that fixes the normalization used for MLflow comparability and (in M2+) for converting diagnostics to code units. A pint-parsable string (`"9.05e21 /cc"`) or a bare number interpreted as cm^-3 (the OSIRIS `simulation.n0` convention). Falls back to the deck's `my_constants.n0` interpreted as SI m^-3. |
+| `binary` | string | Path to the built WarpX executable. Optional — see [Binary resolution](#binary-resolution). |
+| `mpi_ranks` | int | `1` runs the binary directly; `>1` launches `<mpi_launcher> -n N` (default `1`) |
+| `mpi_launcher` | string | Launcher for `mpi_ranks > 1` (default `srun`; use `mpirun` locally) |
+| `extra_mpi_args` | list[string] | Extra arguments passed to the launcher, e.g. `["--gpus-per-task=1"]` |
+| `run_root` | string | Parent directory for per-run working dirs (default `./checkpoints`) |
+| `overrides` | mapping | Flat deck patches applied before rendering. See [below](#overrides-patching-the-deck). |
+
+> **Note on `run_root`:** as with the OSIRIS wrapper, the default sits inside `checkpoints/`
+> deliberately — sync scripts exclude it, so in-flight and finished WarpX outputs survive a sync.
+
+### Binary resolution
+
+The runner resolves the WarpX executable in this order:
+
+1. `warpx.binary` in the manifest
+2. `WARPX_BIN_<dim>D` environment variable (e.g. `WARPX_BIN_1D`), where the dimensionality is
+   read from the deck's `geometry.dims` (falling back to the length of `amr.n_cell`)
+3. `WARPX_BIN` environment variable
+
+### Overrides: patching the deck
+
+`overrides` is a flat mapping from full ParmParse keys to values, applied to the parsed deck
+before rendering:
+
+```yaml
+warpx:
+  overrides:
+    amr.n_cell: 512
+    max_step: 2000
+    electrons.density_function: "n0*exp(z/Ln)"   # base name resolves to the (x,y,z) key
+    laser1.e_max: 3.66e10
+```
+
+- A key may be given without its parser-argument spec (`electrons.density_function` matches
+  `electrons.density_function(x,y,z)`) when unambiguous.
+- Unknown keys are appended — WarpX ignores unused parameters, and a new key (e.g. an extra
+  diagnostic) is a legitimate override.
+- List values are rendered space-separated, matching ParmParse syntax.
+
+The post-override deck is what runs, is logged key-by-key to MLflow (under `deck.*`), and is
+archived as the `inputs` artifact; WarpX's own `warpx_used_inputs` is archived too for provenance.
+
+## Units
+
+`write_units` derives the same canonical scales the other adept solvers log (`wp0`, `tp0`, `n0`,
+`x0` = skin depth, `v0` = c) from `reference_density`, plus the physical laser drive scales
+(`w_laser`, `laser_wavelength`, `laser_a0`, `laser_intensity`) from the first laser's
+`wavelength` and `e_max`. WarpX decks are SI, so this is an SI → normalized derivation — the
+inverse direction of the OSIRIS wrapper.
+
+## Status
+
+M1 (wrapper skeleton): deck parsing/overrides/logging, subprocess runner with
+salvage-on-partial-output, units, and provenance/reduced-diagnostics artifact upload. The
+openPMD → NetCDF layer, code-units conversion of diagnostics, and canned plots are M2 — see
+`dev_docs/warpx-wrapper-plan.md` on the `warpx-wrapper` branch for the plan of record.
