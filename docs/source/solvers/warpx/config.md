@@ -83,9 +83,55 @@ archived as the `inputs` artifact; WarpX's own `warpx_used_inputs` is archived t
 `wavelength` and `e_max`. WarpX decks are SI, so this is an SI → normalized derivation — the
 inverse direction of the OSIRIS wrapper.
 
+## output
+
+Optional block controlling post-processing, mirroring the OSIRIS wrapper:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `diagnostics_to_log` | list[string] | Whitelist of diagnostics to convert/upload, matched on the contract key (`FLD/e1`) or its leaf name (`e1`). Default: everything. |
+| `v_th` | float | Electron thermal velocity (units of c) for the Langmuir/Bohm–Gross overlay on ω–k plots |
+| `omega_k_zoom` | float \| null | `(k, ω)` half-width for the equal-aspect lower ω–k panel (`null` → full Nyquist) |
+| `overlay_density` | float | Density (units of `reference_density`) at which dispersion overlays are evaluated (`ω_p = sqrt(n)`) |
+| `bam` | bool | Shade the beam-acoustic-mode band on ω–k plots (needs `v_th`) |
+
+## Post-processing artifacts
+
+After the run, `post.collect` converts the WarpX output into the same per-diagnostic NetCDF
+contract the OSIRIS wrapper emits, in **code units** fixed by `reference_density` (time in
+`1/ω_p`, length in `c/ω_p`, fields in `m_e c ω_p / e`, current in `e n_0 c`; SI passthrough
+when no reference density is available). The 1D axis mapping is the handedness-preserving
+cyclic relabeling `(z, x, y) → (1, 2, 3)`, so `E_z → e1` (longitudinal), `E_x → e2`,
+`E_y → e3`, and the OSIRIS sign conventions (including the left/right Riemann pairs) carry
+over:
+
+```
+binary/FLD/e1.nc …           stacked (t, x1) field series, OSIRIS naming
+binary/DENSITY/<sp>/charge.nc  rho_<species> in e·n0 units (when dumped)
+binary/RAW/<species>.nc      long-form particle dumps (x1, p1–p3 in m_s c, ene = γ−1,
+                             q = signed macro-charge, w = openPMD weighting)
+binary/REDUCED/<name>.nc     native SI reduced-diagnostic tables
+binary/HIST/energy.nc        OSIRIS energy-history schema from FieldEnergy+ParticleEnergy
+plots/…                      the OSIRIS canned plot set + reduced/<name>.png traces
+```
+
+Because the contract matches, `adept.osiris.io.list_diagnostics` / `load_series` and the
+OSIRIS canned plots read these files unchanged. Logged metrics include `final_step`,
+`completed_steps_frac` (the exit-0 early-termination tripwire — WarpX exits 0 on
+`break_signals` and silently ignores typo'd parameters), `field/efield/bfield_energy_final`
+(code units, from the FieldEnergy reduced diagnostic), and `energy_drift_frac`.
+
+Regenerate the plot set offline from the saved NetCDFs (or convert a raw run directory
+in place):
+
+```
+python -m adept.warpx.regen <run-or-binary-dir> [--out DIR] [--v-th 0.0885] [...]
+```
+
 ## Status
 
 M1 (wrapper skeleton): deck parsing/overrides/logging, subprocess runner with
-salvage-on-partial-output, units, and provenance/reduced-diagnostics artifact upload. The
-openPMD → NetCDF layer, code-units conversion of diagnostics, and canned plots are M2 — see
+salvage-on-partial-output, units, provenance upload. M2 (io + plots): openPMD → NetCDF
+conversion to the OSIRIS `binary/` contract, code-units conversion, reduced-diagnostic
+parsers, canned plots, `regen`. The SRS deck + parity postproc adapter is M3 — see
 `dev_docs/warpx-wrapper-plan.md` on the `warpx-wrapper` branch for the plan of record.

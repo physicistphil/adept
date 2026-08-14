@@ -143,6 +143,22 @@ payoff, but start the 1:1 with the **collisionless** pair to isolate PIC-core pa
 - **M2 — io + general plots**: openPMD→NetCDF layer, units (SI→normalized), general
   canned plots (spacetime, lineouts, ω–k, energy traces), `regen`. Reduced-diag
   parsers land here.
+  **DONE 2026-08-14.** `adept/warpx/io.py` reads openPMD-h5 with plain h5py (no
+  openpmd-api dep) and emits the *same* `binary/<diag>.nc` contract the OSIRIS
+  wrapper writes — keys (`FLD/e1`, `RAW/<sp>`, `HIST/energy`, `REDUCED/<name>`),
+  dims `(t, x1)`, code units from `CodeUnits(n0)`, OSIRIS attrs — via the
+  handedness-preserving 1D cyclic map `(z,x,y)→(1,2,3)` (`E_z→e1`, `E_x→e2`,
+  `E_y→e3`, `B_z→b1`, …), so `adept.osiris.plots.save_canned_plots` renders WarpX
+  runs **unchanged** (spacetime/lineouts/ω–k/currents/Riemann field_decomp/energy
+  traces); `HIST/energy.nc` is built from FieldEnergy+ParticleEnergy in the exact
+  `load_hist_energy` schema so conservation plots + `energy_drift_frac` work too.
+  `plots.py` adds per-reduced-diag trace figures; `post.collect` gains the
+  conversion, plots, energy metrics, and the `completed_steps_frac` exit-0
+  tripwire; `regen.py` mirrors the OSIRIS CLI (and converts a raw `diags/` dir in
+  place, recovering units via `io.code_units_for_run`). Verified against committed
+  fixtures = the real M1 smoke-run output (`tests/test_warpx/fixtures/smoke-1d/`,
+  2.6 MB): 48 tests incl. hand-checked unit conversions (p1 spread = deck
+  `ux_std`, macro-charge sum = profile mean, staggering at dz/2).
 - **M3 — SRS deck + parity postproc**: WarpX-native 1D SRS deck (antenna, exponential
   profile, PML, laser-off gap, full diagnostic set); `warpx_lpi` adapter +
   `WarpxLPI`; `collect_srs` running unchanged on a WarpX run producing the full
