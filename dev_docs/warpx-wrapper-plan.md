@@ -163,6 +163,38 @@ payoff, but start the 1:1 with the **collisionless** pair to isolate PIC-core pa
   profile, PML, laser-off gap, full diagnostic set); `warpx_lpi` adapter +
   `WarpxLPI`; `collect_srs` running unchanged on a WarpX run producing the full
   metric set + `srs_timeseries.nc` + plots.
+  **DONE 2026-08-14.** Because M2 fixed the `binary/` contract, the "adapter"
+  collapsed into the io layer: `adept/warpx/io.py` now converts
+  ParticleHistogram2D openPMD histories → `PHA/<name>/<species>.nc` in the
+  OSIRIS phase-space conventions (edge-style axes; count deposits as
+  charge-signed `q·f` with `Σ f·d(axis) = n/n0`; flux deposits — value
+  functions in `m_e c^3`-reduced form — normalized so the ordinate integral is
+  a flux in `n0 m_e c^3` units), 1-D ParticleHistogram txt → `PHA` spectra,
+  and BoundaryScraping → `SCRAPED/<sp>/<edge>.nc`; deck-named diagnostics
+  (`p1x1`, `x1log_gamma_q1`, `log_gamma`) then drive `collect_srs`'s dispatch
+  **unchanged** via `adept.osiris.io`. osiris-lpi was made installable
+  (hatchling, `osiris_lpi` package only) and warpx-lpi depends on it
+  (editable path dep) — decision (1) resolved as "installable". `WarpxLPI`
+  runs `collect_srs` on `td/binary` (drive params from `write_units`:
+  a0, ω0/ωp0, t_unit_ps) + the native cross-checks in `warpx_lpi/native.py`
+  (`*_poynting` R/T from FieldPoyntingFlux, `*_native` EPW fit from
+  FieldReduction, `*_scraped` wall flux). Deck
+  `warpx-lpi/sims/srs-Ln100-Te4-1d/inputs-1d`: scan2-matched physics (§4)
+  with all diagnostics at OSIRIS cadence (60 steps = 10.68/ω0). Verified on
+  committed real fixtures (`tests/test_warpx/fixtures/srs-mini-1d`, a real
+  Perlmutter run of the shrunk deck; 56 adept + 9 warpx-lpi + 99 osiris-lpi
+  tests) and live on debug QOS: the 2 ps / 4×-threshold smoke logged the full
+  parity set (`epw_growth_rate` 0.00352 with the native fit agreeing to 0.3%,
+  `T_hot_keV` 73, `hot_e_flux_frac_fwd_50keV` 0.79, R/T/A budget, onset,
+  `srs_timeseries.nc`, full plot set). Gotchas: `amr.n_cell = 3594` needs
+  `blocking_factor = 2` (default 8 aborts); ParticleHistogram2D defaults to
+  bp5 — pin `<name>.openpmd_backend = h5` — and leaves an *empty* companion
+  `.txt` (skip it; it once broke the HIST builder); its openPMD iteration key
+  is the plain step (not step+1) with a correct `time` attr; thermal particle
+  walls leave the scraping buffers empty (parity walls beat the scraped
+  estimator — revisit at M4). Antenna calibration flag for M4a:
+  `laser_incident_measured_frac` = 1.76 — the antenna embedded in
+  0.18 n0 plasma radiates ~1.76× the vacuum-normalized I0.
 - **M4 — validation ladder**: (a) vacuum laser propagation: `laser_incident_measured_frac`≈1,
   $R$≈0, $T$≈1; (b) linear EPW/Landau or two-stream growth vs OSIRIS same-physics run;
   (c) the srs-Ln100-Te4 collisionless 1:1 — side-by-side $R(t)$, $W(t)$ growth rate,

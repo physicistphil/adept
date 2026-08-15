@@ -110,10 +110,37 @@ binary/FLD/e1.nc …           stacked (t, x1) field series, OSIRIS naming
 binary/DENSITY/<sp>/charge.nc  rho_<species> in e·n0 units (when dumped)
 binary/RAW/<species>.nc      long-form particle dumps (x1, p1–p3 in m_s c, ene = γ−1,
                              q = signed macro-charge, w = openPMD weighting)
+binary/PHA/<name>/<sp>.nc    ParticleHistogram2D phase spaces / ParticleHistogram
+                             spectra in OSIRIS phase-space conventions (see below)
+binary/SCRAPED/<sp>/<edge>.nc  BoundaryScraping buffers, long-form + t_scraped
 binary/REDUCED/<name>.nc     native SI reduced-diagnostic tables
 binary/HIST/energy.nc        OSIRIS energy-history schema from FieldEnergy+ParticleEnergy
 plots/…                      the OSIRIS canned plot set + reduced/<name>.png traces
 ```
+
+### Phase-space histograms (`PHA/`)
+
+`ParticleHistogram2D` reduced diagnostics (openPMD dirs under
+`diags/reducedfiles/<name>/`) and 1-D `ParticleHistogram` tables become
+OSIRIS-style phase spaces keyed `PHA/<name>/<species>` — so naming a
+reduced diagnostic after the OSIRIS phase space it mirrors (`p1x1`,
+`x1log_gamma_q1`, `log_gamma`) makes downstream OSIRIS-convention consumers
+(e.g. `osiris_lpi.collect_srs`) dispatch on it unchanged. The run's rendered
+`inputs` deck drives the conversion:
+
+- the ordinate dim is named from `histogram_function_ord`: `log10(...)` →
+  `gamma` (the OSIRIS log-γ axis), bare `uz`/`ux`/`uy` → `p1`/`p2`/`p3`;
+- `value_function = w` (a count deposit) is stored as the charge-signed
+  density `(q/|q|)·f` normalized so `Σ f·d(axis) = n(x)/n0` — the OSIRIS
+  cartesian phase-space convention;
+- any other value function is treated as a flux deposit and must be written
+  in the `m_e c^3`-reduced form (e.g. `w*(g-1)*(uz/g)` for the OSIRIS
+  `x1gl_q1` energy-flux deposit `KE·v1`); the stored field integrates over
+  the ordinate to a flux in `n0 m_e c^3` units — the same unit as
+  `I0 = (a0 ω0)^2/2`;
+- axes carry the adept-OSIRIS *edge-style* labels (`linspace(min, max, n)`
+  over the bin range) and the deck's `geometry.prob_lo/hi` become
+  `sim.XMIN/XMAX`.
 
 Because the contract matches, `adept.osiris.io.list_diagnostics` / `load_series` and the
 OSIRIS canned plots read these files unchanged. Logged metrics include `final_step`,
@@ -133,5 +160,7 @@ python -m adept.warpx.regen <run-or-binary-dir> [--out DIR] [--v-th 0.0885] [...
 M1 (wrapper skeleton): deck parsing/overrides/logging, subprocess runner with
 salvage-on-partial-output, units, provenance upload. M2 (io + plots): openPMD → NetCDF
 conversion to the OSIRIS `binary/` contract, code-units conversion, reduced-diagnostic
-parsers, canned plots, `regen`. The SRS deck + parity postproc adapter is M3 — see
+parsers, canned plots, `regen`. M3 (SRS parity): phase-space histogram / boundary-scraping
+conversion (`PHA/`, `SCRAPED/`) feeding the `osiris_lpi` SRS analyses unchanged; the SRS
+deck and the `WarpxLPI` adapter live in the `warpx-lpi` repo. See
 `dev_docs/warpx-wrapper-plan.md` on the `warpx-wrapper` branch for the plan of record.

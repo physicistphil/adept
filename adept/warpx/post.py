@@ -96,7 +96,14 @@ def collect(run_output: dict, cfg: dict, td: str) -> dict[str, Any]:
     # normalization is fixed, else native J/m^2 (1D).
     try:
         e_scale = units.u_area0 if units is not None else 1.0
-        tables = {name: _io.parse_reduced_diag(p) for name, p in _io.list_reduced_diags(run_dir).items()}
+        # Per-table best-effort: ParticleHistogram2D leaves an empty companion
+        # .txt that must not abort the energy scalars.
+        tables = {}
+        for name, p in _io.list_reduced_diags(run_dir).items():
+            try:
+                tables[name] = _io.parse_reduced_diag(p)
+            except Exception:
+                continue
         fld = next((ds for ds in tables.values() if "total_lev0" in ds.data_vars), None)
         if fld is not None:
             metrics["field_energy_final"] = float(fld["total_lev0"].values[-1]) / e_scale
