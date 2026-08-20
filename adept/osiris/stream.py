@@ -501,15 +501,14 @@ class _DrainCore:
                 # Already in the file (resume / idempotency): just tidy up.
                 self._cleanup_consumed(rel, p)
                 continue
-            try:
-                da = _io.load_grid_h5(p)
-            except Exception as e:
-                self._quarantine(rel, p, e)
+            loaded = self._load_dump(rel, p)
+            if loaded is None:
                 continue
+            da, src = loaded
             w.append(da)
             self._stats["appended"] += 1
             self._stats["appended_bytes"] += int(da.values.nbytes)
-            self._cleanup_consumed(rel, p)
+            self._cleanup_consumed(rel, src)
         w.flush()
 
         if final:
@@ -523,23 +522,56 @@ class _DrainCore:
         """Create (or reopen) the writer from the first readable candidate."""
         while candidates:
             p0 = candidates[0]
-            try:
-                template = _io.load_grid_h5(p0)
-            except Exception as e:
-                self._quarantine(rel, p0, e)
+            loaded = self._load_dump(rel, p0)
+            if loaded is None:
                 candidates = candidates[1:]
                 continue
+            template, src = loaded
             w = StreamWriter(self.out_dir / f"{rel}.nc", template, source_dir=d)
             self._writers[rel] = w
             if w.n_written == 0:
                 w.append(template)  # reuse the template we just loaded as slot 0
                 self._stats["appended"] += 1
                 self._stats["appended_bytes"] += int(template.values.nbytes)
-                self._cleanup_consumed(rel, p0)
+                self._cleanup_consumed(rel, src)
                 candidates = candidates[1:]
             # On resume (n_written > 0) p0 stays; the iteration filter decides.
             return w, candidates
         return None, []
+
+    def _dump_sources(self, rel: str, p: Path) -> list[Path]:
+        """Every place a listed dump might be readable, most likely first.
+
+        A staged dump can be mirrored to the persist tree and reaped off the
+        scratch between the directory listing and the read — a *move*, not
+        corruption — so the mirrored twin is a legitimate second source.
+        """
+        srcs = [p]
+        if self.persist_ms is not None and self.persist_ms not in p.parents:
+            srcs.append(self.persist_ms / rel / p.name)
+        return srcs
+
+    def _load_dump(self, rel: str, p: Path) -> tuple[xr.DataArray, Path] | None:
+        """Load one dump as ``(data, the path it came from)``, following a move.
+
+        Tries the listed path, then the persist mirror: a dump that vanished is
+        one another sweep already mirrored, and must not be quarantined —
+        quarantining it is the second half of the ``FLD/e2`` truncation in job
+        57235103, where the finalize sweep hit ``ENOENT`` on the first such dump
+        and dropped every iteration from there to the end of the run. A dump
+        that is *present but unreadable* is still corruption and is quarantined
+        as before. Returns ``None`` (one rate-limited log line) when no source
+        yields data.
+        """
+        for src in self._dump_sources(rel, p):
+            try:
+                return _io.load_grid_h5(src), src
+            except Exception as e:
+                if src.exists():  # present but unreadable: genuine corruption
+                    self._quarantine(rel, src, e)
+                    return None
+        self._log_every(f"gone:{rel}", f"[stream] {rel}: dump {p.name} vanished before it could be read")
+        return None
 
     def _cleanup_consumed(self, rel: str, p: Path) -> None:
         """Dispose of one dump whose contents are (now) in the NetCDF."""
@@ -669,6 +701,7 @@ class StreamConverter:
         rediscover_every: int = 12,
         error_log_every: int = 200,
         workers: int | None = None,
+        finalize_join_s: float = 1800.0,
     ):
         self.ms = Path(run_dir) / "MS"
         self.out_dir = Path(out_dir)
@@ -688,6 +721,11 @@ class StreamConverter:
         self.stats_every_s = float(stats_every_s)
         self.rediscover_every = max(1, int(rediscover_every))
         self.error_log_every = max(1, int(error_log_every))
+        # How long :meth:`finalize` waits for the watcher to finish its current
+        # scan. Must outlast one scan over the deepest backlog the run reaches
+        # (minutes on a fast small-box run), not one poll interval — see
+        # :meth:`finalize` for what a premature timeout costs.
+        self.finalize_join_s = float(finalize_join_s)
         self._log = logger
         self._multibase_skipped: set[str] = set()  # multi-report dirs left to the batch pass
         self._err_counts: dict[str, int] = {}
@@ -762,14 +800,34 @@ class StreamConverter:
         converted by the stream (so the caller can skip rebuilding them in the
         batch pass); RAW relpaths are mirrored but not returned, since the batch
         pass still builds their NetCDFs from the mirrored HDF5.
+
+        The watcher must be **finished**, not merely asked to stop, before the
+        sweep starts: both drain the same diagnostics through the same writers,
+        so two concurrent sweeps put two writers on one NetCDF — each resizing
+        ``t`` against its own stale ``_n_disk`` (duplicated / out-of-order rows,
+        then ``Can't broadcast``) and each mirroring+reaping dumps the other is
+        about to read. That is what corrupted ``FLD/e2`` in job 57235103: the
+        old join timed out after one *poll interval* while a scan over a deep
+        backlog was still running for minutes. ``finalize_join_s`` has to
+        outlast one scan instead; if the watcher is somehow still going after
+        it, the sweep is skipped rather than run alongside — the batch pass in
+        :func:`io.save_run_datasets` rebuilds whatever is missing.
         """
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=max(self.poll_s, 30.0) + 30.0)
-        try:
-            self._scan_once(final=True)
-        except Exception as e:
-            self._log(f"[stream] finalize sweep error (batch fallback covers it): {e}")
+            self._thread.join(timeout=self.finalize_join_s)
+        swept = self._thread is None or not self._thread.is_alive()
+        if swept:
+            try:
+                self._scan_once(final=True)
+            except Exception as e:
+                self._log(f"[stream] finalize sweep error (batch fallback covers it): {e}")
+        else:
+            self._log(
+                f"[stream] CRITICAL: watcher still draining after {self.finalize_join_s:.0f}s -- "
+                "skipping the final sweep rather than running a second concurrent writer "
+                "(the batch pass rebuilds what is missing)"
+            )
         completed: set[str] = set()
         if self._pool is not None:
             try:
@@ -777,7 +835,10 @@ class StreamConverter:
             except Exception as e:
                 self._log(f"[stream] worker pool close error (batch fallback covers it): {e}")
         completed |= self._core.close_all()
-        return completed
+        # Without the authoritative sweep no NetCDF can be claimed complete (the
+        # watcher may still have been appending to any of them), so hand the
+        # batch pass everything rather than a half-drained set.
+        return completed if swept else set()
 
     # --- logging / stats --------------------------------------------------
 

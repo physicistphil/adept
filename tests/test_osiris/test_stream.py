@@ -685,3 +685,130 @@ def test_worker_pool_spill_valve(tmp_path: Path) -> None:
     assert streamed.sizes["t"] == 6
     _assert_series_equiv(streamed, oio.load_series(persist / "MS" / "FLD" / "e1"))
     assert not list((stage / "MS").rglob("*.h5"))
+
+
+# --- concurrent-sweep guards (job 57235103 FLD/e2 corruption) -----------------
+
+
+def test_finalize_waits_out_a_slow_watcher_scan(tmp_path: Path) -> None:
+    """``finalize`` must not sweep while the watcher is still scanning.
+
+    Two concurrent sweeps put two writers on one NetCDF — each resizing ``t``
+    against its own stale ``_n_disk`` — which is what left ``FLD/e2`` with
+    duplicated, out-of-order rows in job 57235103. The old join gave up after
+    one poll interval; a scan over a deep backlog runs far longer than that.
+    """
+    stage = tmp_path / "stage"
+    _write_field(stage, "e1", n_steps=6, nx=8)
+
+    conv = ostream.StreamConverter(stage, tmp_path / "binary", poll_s=0.01, finalize_join_s=30.0)
+    scans: list[float] = []
+    real_scan = conv._scan_once
+
+    def slow_scan(*, final: bool) -> None:
+        scans.append(time.monotonic())
+        if not final:
+            time.sleep(0.5)  # a scan that outlasts poll_s many times over
+        real_scan(final=final)
+
+    conv._scan_once = slow_scan
+    conv.start()
+    time.sleep(0.05)  # let the watcher get into its slow scan
+    completed = conv.finalize()
+
+    assert not conv._thread.is_alive()
+    assert "FLD/e1" in completed
+    streamed = oio.load_series_nc(tmp_path / "binary" / "FLD" / "e1.nc")
+    assert list(streamed["iter"].values) == [0, 10, 20, 30, 40, 50]  # no dupes, in order
+
+
+def test_finalize_skips_sweep_when_watcher_will_not_stop(tmp_path: Path) -> None:
+    """A watcher that outlives the join is left alone, not raced.
+
+    Better to hand the whole set to the batch fallback (empty ``completed``)
+    than to open a second writer on a file the watcher may still be appending
+    to."""
+    stage = tmp_path / "stage"
+    _write_field(stage, "e1", n_steps=4, nx=8)
+
+    conv = ostream.StreamConverter(stage, tmp_path / "binary", poll_s=0.01, finalize_join_s=0.05)
+    finals: list[bool] = []
+    real_scan = conv._scan_once
+    release = __import__("threading").Event()
+
+    def wedged_scan(*, final: bool) -> None:
+        finals.append(final)
+        if not final:
+            release.wait(10.0)  # still "scanning" when finalize gives up
+            return
+        real_scan(final=final)
+
+    conv._scan_once = wedged_scan
+    conv.start()
+    time.sleep(0.05)
+    try:
+        completed = conv.finalize()
+        assert completed == set()  # nothing may be claimed complete
+        assert True not in finals  # the final sweep never ran alongside
+    finally:
+        release.set()
+        conv._thread.join(timeout=5.0)
+
+
+def test_mirrored_dump_is_followed_not_quarantined(tmp_path: Path) -> None:
+    """A dump moved to the persist mirror mid-read is a *move*, not corruption.
+
+    Reading it from the mirror keeps the iteration; quarantining it instead
+    dropped every iteration from that point on, which is how ``FLD/e2`` lost its
+    last 80 dumps in job 57235103."""
+    stage = tmp_path / "stage"
+    persist = tmp_path / "persist"
+    diag = _write_field(stage, "e1", n_steps=6, nx=8)
+
+    core = ostream._DrainCore(
+        persist / "binary", persist_dir=persist, discard_grid_h5=True, logger=lambda _m: None
+    )
+    # The other sweep mirrors + reaps this dump after the listing, while the
+    # drain is working through the batch — so the load hits a vanished path.
+    victim = diag / "e1-000030.h5"
+    twin = persist / "MS" / "FLD" / "e1" / victim.name
+    twin.parent.mkdir(parents=True, exist_ok=True)
+    real_load = oio.load_grid_h5
+
+    def racing_load(path):
+        if Path(path) == victim and victim.exists():
+            victim.rename(twin)  # vanishes between the listing and this open
+        return real_load(path)
+
+    ostream._io.load_grid_h5 = racing_load
+    try:
+        core.drain_rel("FLD/e1", diag, final=True, force_spill=False)
+        core.close_all()
+    finally:
+        ostream._io.load_grid_h5 = real_load
+
+    streamed = oio.load_series_nc(persist / "binary" / "FLD" / "e1.nc")
+    assert core._stats["quarantined"] == 0
+    assert list(streamed["iter"].values) == [0, 10, 20, 30, 40, 50]  # iteration 30 recovered
+    assert not list(diag.glob("*.h5.bad"))
+    assert not twin.exists()  # consumed from the mirror, then discarded
+
+
+def test_unreadable_dump_still_quarantined(tmp_path: Path) -> None:
+    """The mirror fallback must not swallow genuine corruption: a dump that is
+    present but unreadable is quarantined exactly as before."""
+    stage = tmp_path / "stage"
+    persist = tmp_path / "persist"
+    diag = _write_field(stage, "e1", n_steps=5, nx=8)
+    (diag / "e1-000020.h5").write_bytes(b"\x00" * 2048)
+
+    core = ostream._DrainCore(
+        persist / "binary", persist_dir=persist, discard_grid_h5=True, logger=lambda _m: None
+    )
+    core.drain_rel("FLD/e1", diag, final=True, force_spill=False)
+    core.close_all()
+
+    assert core._stats["quarantined"] == 1
+    assert (diag / "e1-000020.h5.bad").exists()
+    streamed = oio.load_series_nc(persist / "binary" / "FLD" / "e1.nc")
+    assert list(streamed["iter"].values) == [0, 10, 30, 40]
