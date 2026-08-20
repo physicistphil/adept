@@ -21,16 +21,22 @@ Because the contract matches, :func:`adept.osiris.io.list_diagnostics` /
 (:mod:`adept.osiris.plots`) renders WarpX runs as-is — that is the whole
 point (see ``dev_docs/warpx-wrapper-plan.md``, M2).
 
-Axis convention (1D): the WarpX axis is ``z``; the OSIRIS-comparison
-mapping is the cyclic relabeling ``(z, x, y) → (1, 2, 3)``:
+Axis convention (cartesian 1D/2D/3D): the WarpX propagation axis is ``z``;
+the OSIRIS-comparison mapping is the cyclic relabeling
+``(z, x, y) → (1, 2, 3)`` for both field components and axes:
 
     ``E_z → e1``  ``E_x → e2``  ``E_y → e3``
     ``B_z → b1``  ``B_x → b2``  ``B_y → b3``   (likewise ``j``)
+    axes  ``z → x1``  ``x → x2``  ``y → x3``
 
-which preserves handedness, so OSIRIS sign conventions — including the
-left/right-going Riemann pairs ``(e2, b3)`` / ``(e3, b2)`` — carry over
-verbatim. Multi-D output keeps WarpX-native names and axis labels (no
-OSIRIS mapping is defined for it here).
+``(z, x, y)`` is a right-handed triple, so OSIRIS sign conventions —
+including the left/right-going Riemann pairs ``(e2, b3)`` / ``(e3, b2)``
+and the Poynting component ``s1 = e2 b3 − e3 b2`` — carry over verbatim.
+In 2D (WarpX XZ geometry) the simulated plane maps to OSIRIS ``(x1, x2)``
+with ``y``/``3`` out of plane, matching the OSIRIS 2D convention. Series
+are stored ``(t, x2, x1)`` (2D) exactly like OSIRIS diagnostics. RZ
+output (axis labels outside ``{x, y, z}``) keeps WarpX-native names and
+axes — no OSIRIS mapping is defined for it here.
 """
 
 from __future__ import annotations
@@ -176,8 +182,10 @@ def code_units_for_run(src: str | Path) -> CodeUnits | None:
 
 # --- OSIRIS-comparison naming ----------------------------------------------
 
-# 1D cyclic axis relabeling (z, x, y) -> (1, 2, 3); see module docstring.
-_COMPONENT_1D = {"z": "1", "x": "2", "y": "3"}
+# Cartesian cyclic relabeling (z, x, y) -> (1, 2, 3); see module docstring.
+# Applies to field components and, via _AXIS_TO_OSIRIS, to axis labels.
+_COMPONENT_TO_OSIRIS = {"z": "1", "x": "2", "y": "3"}
+_AXIS_TO_OSIRIS = {"z": "x1", "x": "x2", "y": "x3"}
 
 # Per-record conversion + labels. ``scale`` names the CodeUnits attribute
 # that divides the SI values; ``units`` is the OSIRIS-style TeX unit label.
@@ -188,19 +196,21 @@ _MESH_KINDS = {
 }
 
 
-def _mesh_diag_key(mesh: str, comp: str | None, one_d: bool) -> tuple[str, dict[str, Any]] | None:
+def _mesh_diag_key(mesh: str, comp: str | None, cartesian: bool = True) -> tuple[str, dict[str, Any]] | None:
     """Map an openPMD mesh (+ component) to an OSIRIS-contract diagnostic key.
 
     Returns ``(relpath, info)`` where ``info`` carries the conversion scale
     attribute name and label strings, or ``None`` for records this layer does
-    not convert (e.g. multi-D fields keep native names via the fallback in
-    the caller).
+    not convert. ``cartesian`` says the record's axes are a subset of
+    ``{x, y, z}`` (1D z / 2D XZ / 3D), where the ``(z, x, y) → (1, 2, 3)``
+    relabeling is defined; RZ records keep native names via the fallback in
+    the caller.
     """
     if mesh in _MESH_KINDS and comp is not None:
         kind = _MESH_KINDS[mesh]
-        if one_d and comp in _COMPONENT_1D:
-            name = f"{kind['osiris']}{_COMPONENT_1D[comp]}"
-            long_name = f"{kind['long']}_{_COMPONENT_1D[comp]}"
+        if cartesian and comp in _COMPONENT_TO_OSIRIS:
+            name = f"{kind['osiris']}{_COMPONENT_TO_OSIRIS[comp]}"
+            long_name = f"{kind['long']}_{_COMPONENT_TO_OSIRIS[comp]}"
         else:
             name = f"{mesh}{comp}"
             long_name = f"{mesh}_{comp}"
@@ -336,14 +346,16 @@ def load_field_series(
     *,
     units: CodeUnits | None = None,
 ) -> xr.DataArray:
-    """Stack one mesh component's time history into a ``(t, x1)`` DataArray.
+    """Stack one mesh component's time history into a ``(t, …)`` DataArray.
 
     Values and axes are converted to code units when ``units`` is given
     (fields via the record's scale, coordinates via ``x0``, time via
     ``wp0``); otherwise everything stays SI and the attrs say so. The
-    returned array follows the OSIRIS series conventions (dims ``(t, x1)``
-    in 1D, coords ``t``/``iter``, attrs ``axis_units`` / ``sim.XMIN`` / …)
-    so downstream plotting treats it like any OSIRIS diagnostic.
+    returned array follows the OSIRIS series conventions — dims ``(t, x1)``
+    in 1D and ``(t, x2, x1)`` in 2D XZ (axes relabeled ``z → x1``,
+    ``x → x2``, ``y → x3``), coords ``t``/``iter``, attrs ``axis_units`` /
+    ``sim.XMIN`` (ordered ``x1, x2, …``) — so downstream plotting treats it
+    like any OSIRIS diagnostic. RZ axes keep their native labels.
     """
     diag_dir = Path(diag_dir)
     files = _openpmd_files(diag_dir)
@@ -355,7 +367,7 @@ def load_field_series(
     iters: list[int] = []
     axes: list[dict] | None = None
     unit_si = 1.0
-    one_d = True
+    cartesian = True
     for path in files:
         with h5py.File(path, "r") as f:
             meshes_path = _decode(f.attrs.get("meshesPath", "fields/")).strip("/")
@@ -374,7 +386,7 @@ def load_field_series(
                     for d, ax in enumerate(axes):
                         s = stag[d] if d < stag.size else 0.0
                         ax["coords"] = ax["coords"] + s * ax["spacing"]
-                    one_d = len(axes) == 1
+                    cartesian = all(ax["label"] in _AXIS_TO_OSIRIS for ax in axes)
                 slabs.append(np.asarray(arr))
                 t_si = float(grp.attrs.get("time", 0.0)) * float(grp.attrs.get("timeUnitSI", 1.0))
                 times.append(t_si)
@@ -387,7 +399,7 @@ def load_field_series(
     t = np.asarray(times, dtype="float64")[order]
     its = np.asarray(iters, dtype="int64")[order]
 
-    key_info = _mesh_diag_key(mesh, comp, one_d)
+    key_info = _mesh_diag_key(mesh, comp, cartesian)
     if key_info is not None:
         _rel, info = key_info
         scale = getattr(units, info["scale"]) if units is not None else 1.0
@@ -407,13 +419,11 @@ def load_field_series(
     dims = ["t"]
     axis_units: dict[str, str] = {}
     axis_long: dict[str, str] = {}
-    xmin: list[float] = []
-    xmax: list[float] = []
-    nx: list[int] = []
-    for d, ax in enumerate(axes):
-        if one_d and ax["label"] == "z":
-            dim = "x1"
-            axis_long[dim] = "x_1"
+    extents: list[tuple[str, float, float, int]] = []
+    for ax in axes:
+        if cartesian:
+            dim = _AXIS_TO_OSIRIS[ax["label"]]
+            axis_long[dim] = f"x_{dim[1:]}"
         else:
             dim = ax["label"]
             axis_long[dim] = ax["label"]
@@ -425,9 +435,14 @@ def load_field_series(
             axis_units[dim] = "m"
         coords[dim] = cv
         dims.append(dim)
-        xmin.append(float(cv[0]))
-        xmax.append(float(cv[-1]))
-        nx.append(int(cv.size))
+        extents.append((dim, float(cv[0]), float(cv[-1]), int(cv.size)))
+    # sim.XMIN/XMAX/NX are indexed by the OSIRIS axis number (x1 -> entry 0),
+    # so order them x1, x2, … regardless of the openPMD axis order.
+    if cartesian:
+        extents.sort(key=lambda e: e[0])
+    xmin = [e[1] for e in extents]
+    xmax = [e[2] for e in extents]
+    nx = [e[3] for e in extents]
 
     attrs = {
         "long_name": long_name,
@@ -443,7 +458,11 @@ def load_field_series(
         "sim.XMAX": xmax,
         "sim.NX": nx,
     }
-    return xr.DataArray(data, coords=coords, dims=dims, name=name, attrs=attrs)
+    da = xr.DataArray(data, coords=coords, dims=dims, name=name, attrs=attrs)
+    if cartesian and len(dims) > 2:
+        # OSIRIS multi-D storage order: (t, …, x2, x1).
+        da = da.transpose("t", *sorted(dims[1:], reverse=True))
+    return da
 
 
 def load_particle_species(
@@ -1077,6 +1096,135 @@ def list_scraping_dirs(run_dir: str | Path) -> dict[str, Path]:
 # --- batch conversion (the binary/ contract) --------------------------------
 
 
+def _laser_wavelength_code(deck: dict | None, units: CodeUnits | None) -> float | None:
+    """The first laser's wavelength in code units (c/ω_p), when known."""
+    if deck is None or units is None:
+        return None
+    names = _deck_get(deck, "lasers.names")
+    name = (names[0] if names else None) if isinstance(names, list) else names
+    if name is None:
+        return None
+    lam = _deck_get(deck, f"{name}.wavelength")
+    try:
+        return float(lam) / units.x0
+    except (TypeError, ValueError):
+        return None
+
+
+def save_s1_lineouts(
+    out_dir: str | Path,
+    *,
+    deck: dict | None = None,
+    units: CodeUnits | None = None,
+    guard_cells: int = 2,
+    window_wavelengths: float = 2.0,
+) -> list[Path]:
+    r"""Derive OSIRIS-style ``s1`` boundary lineouts from converted 2D fields.
+
+    OSIRIS 2D SRS decks dump the net longitudinal Poynting flux ``s1`` as
+    time-averaged lineouts along ``x2`` just inside the laser entrance and
+    exit, and the whole R/T budget chain downstream (``osiris_lpi``'s F5 /
+    ``s1_transmission_budget``) keys off those two diagnostics. WarpX has no
+    equivalent output, so this synthesizes them from the already-converted
+    2D field series in ``out_dir``: ``s1 = e2 b3 − e3 b2`` (code units, in
+    which the pump intensity is ``I0 = (a0 ω0)^2 / 2``), averaged over a
+    thin ``x1`` slab at each end of the box.
+
+    The slab average replaces the OSIRIS ``tavg``: the dumps are
+    instantaneous, and a traveling wave's ``2 k0`` flux oscillation averages
+    out over a slab an integer number of half-wavelengths wide. The slab
+    spans ``window_wavelengths`` pump wavelengths (wavelength from the deck
+    laser when known, else 16 cells), starting ``guard_cells`` inside each
+    ``x1`` edge — downstream of the hard-source antenna the SRS decks park
+    half a cell off the lo-z wall, so the entrance slab sees incident minus
+    reflected flux exactly like the OSIRIS entrance lineout.
+
+    The Yee-staggered components are multiplied positionally (same cell
+    index) rather than through coordinate alignment; the half-cell offset is
+    irrelevant at the slab/budget level. Writes
+    ``FLD/s1-line-x2-0001.nc`` (entrance) and ``FLD/s1-line-x2-0002.nc``
+    (exit) — names matched by ``osiris_lpi``'s s1-lineout discovery — and
+    returns the written paths (empty when the converted fields are not 2D or
+    the transverse pair is missing).
+    """
+    from adept.osiris.io import series_to_dataset
+
+    out_dir = Path(out_dir)
+
+    def _open(comp: str) -> xr.DataArray | None:
+        p = out_dir / "FLD" / f"{comp}.nc"
+        if not p.is_file():
+            return None
+        ds = xr.open_dataset(p, engine="h5netcdf")
+        return ds[comp] if comp in ds else None
+
+    e2, b3 = _open("e2"), _open("b3")
+    if e2 is None or b3 is None:
+        return []
+    if not {"t", "x1", "x2"} <= set(map(str, e2.dims)) or e2.ndim != 3:
+        return []
+    e3, b2 = _open("e3"), _open("b2")
+    pairs = [(e2, b3, 1.0)]
+    if e3 is not None and b2 is not None and e3.ndim == 3:
+        pairs.append((e3, b2, -1.0))
+
+    n_x1 = int(e2.sizes["x1"])
+    x1v = np.asarray(e2.coords["x1"].values, dtype=float)
+    dx1 = float(x1v[1] - x1v[0]) if n_x1 > 1 else 1.0
+    lam = _laser_wavelength_code(deck, units)
+    win = int(round(window_wavelengths * lam / dx1)) if lam and dx1 > 0 else 16
+    win = max(4, min(win, max(4, n_x1 // 8)))
+    guard = max(0, int(guard_cells))
+    if 2 * (guard + win) > n_x1:
+        return []
+    slabs = {
+        "0001": slice(guard, guard + win),
+        "0002": slice(n_x1 - guard - win, n_x1 - guard),
+    }
+
+    nt = min(int(da.sizes["t"]) for pair in pairs for da in pair[:2])
+    written: list[Path] = []
+    for tag, sl in slabs.items():
+        s1 = None
+        for e, b, sign in pairs:
+            ev = e.isel(t=slice(nt), x1=sl).transpose("t", "x2", "x1").values
+            bv = b.isel(t=slice(nt), x1=sl).transpose("t", "x2", "x1").values
+            term = sign * np.mean(ev.astype("float64") * bv, axis=-1)
+            s1 = term if s1 is None else s1 + term
+        ref = e2.isel(t=slice(nt))
+        da = xr.DataArray(
+            s1.astype(_DIAG_DTYPE),
+            coords={
+                "t": ref.coords["t"].values,
+                "iter": ("t", ref.coords["iter"].values),
+                "x2": e2.coords["x2"].values,
+            },
+            dims=["t", "x2"],
+            name="s1",
+            attrs={
+                "long_name": "s_1",
+                "units": r"m_e c^3 n_0" if units is not None else "SI",
+                "time_units": e2.attrs.get("time_units", r"1/\omega_p"),
+                "axis_units": {
+                    "x2": e2.coords["x2"].attrs.get(
+                        "units", "m" if units is None else r"c / \omega_p"
+                    )
+                },
+                "axis_long_names": {"x2": "x_2"},
+                "derived_from": "e2*b3 - e3*b2" if len(pairs) == 2 else "e2*b3",
+                "x1_slab_cells": [int(sl.start), int(sl.stop)],
+                "x1_slab_window": [float(x1v[sl.start]), float(x1v[sl.stop - 1])],
+                "guard_cells": guard,
+            },
+        )
+        rel = f"FLD/s1-line-x2-{tag}"
+        dest = out_dir / f"{rel}.nc"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        series_to_dataset(da).to_netcdf(dest, engine="h5netcdf")
+        written.append(dest)
+    return written
+
+
 def _full_diag_dirs(run_dir: Path) -> list[Path]:
     """Full-diagnostic openPMD directories under ``diags/`` (skips reducedfiles)."""
     diags = run_dir / "diags"
@@ -1111,7 +1259,9 @@ def save_run_datasets(
       with per-particle ``t_scraped``);
     - ``REDUCED/<name>.nc`` (native SI reduced tables);
     - ``HIST/energy.nc`` (the OSIRIS energy-history schema, from
-      FieldEnergy + ParticleEnergy when present).
+      FieldEnergy + ParticleEnergy when present);
+    - ``FLD/s1-line-x2-000{1,2}.nc`` (2D runs: derived entrance/exit
+      Poynting-flux lineouts, see :func:`save_s1_lineouts`).
 
     The run's rendered ``inputs`` deck (when present) drives the routing:
     histogram functions, species names, bin ranges and charge signs come
@@ -1148,7 +1298,8 @@ def save_run_datasets(
             except Exception as e:  # one bad record must not abort the rest
                 print(f"[post] skipping {mesh}/{comp} from {diag_dir.name}: {e}")
                 continue
-            key_info = _mesh_diag_key(mesh, comp, one_d=int(da.attrs["sim.NDIMS"]) == 1)
+            cartesian = all(str(d).startswith("x") for d in da.dims if str(d) != "t")
+            key_info = _mesh_diag_key(mesh, comp, cartesian)
             rel = key_info[0] if key_info is not None else f"FLD/{da.name}"
             if rel in taken:
                 rel = f"{rel}-{diag_dir.name}"
@@ -1230,5 +1381,12 @@ def save_run_datasets(
             write(energy, "HIST/energy")
     except Exception as e:
         print(f"[post] skipping HIST energy: {e}")
+
+    # Derived s1 entrance/exit lineouts (2D runs only; see save_s1_lineouts).
+    if want("FLD/s1-line-x2-0001") or want("FLD/s1-line-x2-0002"):
+        try:
+            written += save_s1_lineouts(out_dir, deck=deck, units=units)
+        except Exception as e:
+            print(f"[post] skipping derived s1 lineouts: {e}")
 
     return written

@@ -120,7 +120,9 @@ class BaseWarpX(ADEPTModule):
 
         WarpX computes ``dt`` internally from the CFL number, so the step
         count for a ``stop_time``-terminated run is an estimate based on the
-        1D FDTD relation ``dt = cfl * dx / c``.
+        FDTD Yee limit ``dt = cfl / (c sqrt(sum 1/dx_d^2))`` — the 1D
+        ``cfl * dx / c`` generalized to the run's dimensionality (the 1D
+        relation applied to a 2D run under-counted steps by sqrt(2)).
         """
         derived: dict[str, Any] = {}
         nx = self._deck_array("amr.n_cell")
@@ -134,7 +136,8 @@ class BaseWarpX(ADEPTModule):
             derived["dx"] = [(float(hi[d]) - float(lo[d])) / int(nx[d]) for d in range(len(nx))]
             if cfl is not None:
                 c_si = 299792458.0
-                derived["dt_est"] = float(cfl) * min(derived["dx"]) / c_si
+                inv_sq = sum(1.0 / float(d) ** 2 for d in derived["dx"] if float(d) > 0)
+                derived["dt_est"] = float(cfl) / (c_si * inv_sq**0.5)
                 if stop_time is not None:
                     derived["num_steps_est"] = int(float(stop_time) / derived["dt_est"])
         if max_step is not None:
