@@ -1279,6 +1279,186 @@ def save_s1_lineouts(
     return written
 
 
+# --- FieldProbe line reports (the F11/F12 high-cadence inputs) ---------------
+
+# FieldProbe table columns -> the OSIRIS component the cyclic (z, x, y) ->
+# (1, 2, 3) relabeling assigns them (module docstring).
+_PROBE_COMP_TO_OSIRIS = {"Ez": "e1", "Ex": "e2", "Ey": "e3", "Bz": "b1", "Bx": "b2", "By": "b3"}
+_PROBE_COL_RE = re.compile(r"part_(x|y|z|Ex|Ey|Ez|Bx|By|Bz|S)_lev0")
+
+# Components each line orientation feeds downstream (osiris_lpi bundle2d):
+# boundary lines (along x2) carry the Riemann pairs for the omega
+# spectrograms; the axial line (along x1) feeds the (k, omega) maps.
+_PROBE_LINE_COMPONENTS = {"x1": ("e1", "e2"), "x2": ("e2", "b3", "e3", "b2")}
+
+
+def is_field_probe_table(path: str | Path, deck: dict | None = None, name: str | None = None) -> bool:
+    """True when a reduced-diag table is FieldProbe output (long format)."""
+    if deck is not None and name is not None:
+        if str(_deck_get(deck, f"{name}.type")) == "FieldProbe":
+            return True
+    try:
+        with open(path) as fh:
+            return "part_x_lev" in fh.readline()
+    except OSError:
+        return False
+
+
+def _probe_cell_index(fixed_si: float, axis_fixed: str, deck: dict | None, fallback_d: float) -> int:
+    """Grid cell index of a probe line's fixed coordinate.
+
+    ``axis_fixed`` is the WarpX axis (``"x"`` or ``"z"``) held constant along
+    the line; the index comes from the deck geometry (2D ``prob_lo/hi`` and
+    ``n_cell`` are ``[x, z]``-ordered). Without a deck the cell-size proxy is
+    ``fallback_d`` (the probe spacing) — ordering, which is all the
+    downstream entrance/exit convention needs, is preserved either way.
+    """
+    lo = _deck_get(deck, "geometry.prob_lo")
+    hi = _deck_get(deck, "geometry.prob_hi")
+    nc = _deck_get(deck, "amr.n_cell")
+    i = {"x": 0, "z": 1}[axis_fixed]
+    try:
+        lo_i, hi_i, n_i = float(lo[i]), float(hi[i]), int(nc[i])
+        d = (hi_i - lo_i) / n_i
+        return int(np.clip(np.floor((fixed_si - lo_i) / d), 0, n_i - 1))
+    except (TypeError, ValueError, IndexError):
+        d = abs(fallback_d) if fallback_d else 1.0
+        return max(0, int(np.floor(fixed_si / d)))
+
+
+def load_field_probe_lines(
+    path: str | Path,
+    *,
+    units: CodeUnits | None = None,
+    deck: dict | None = None,
+    components: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, xr.DataArray]:
+    r"""Convert one FieldProbe Line table into OSIRIS-style field lineouts.
+
+    FieldProbe writes **one row per probe point per step** (``step, time,
+    part_x/y/z, Ex..Bz, |S|`` — sorted by probe id, i.e. along the line), so
+    the generic :func:`parse_reduced_diag` one-row-per-step model does not
+    apply. This reshapes the long table into ``(t, x2)`` / ``(t, x1)``
+    series in code units, named by the ``osiris_lpi`` line-report contract:
+    ``FLD/<comp>-line-x2-<cell>`` for a line along the transverse axis at
+    fixed x1 cell ``<cell>`` (boundary light monitor — smallest cell =
+    entrance, largest = exit) and ``FLD/<comp>-line-x1-<cell>`` for the
+    axial line at fixed x2 cell. Orientation is inferred from the probe
+    positions themselves (which WarpX axis varies along the line); the cell
+    index of the fixed coordinate comes from the deck geometry.
+
+    ``components`` maps line orientation (``"x1"``/``"x2"``) to the OSIRIS
+    components to emit (default ``_PROBE_LINE_COMPONENTS`` — the ones the
+    bundle reductions read). Returns ``{rel: DataArray}``; empty when the
+    table has no complete step blocks.
+    """
+    path = Path(path)
+    with open(path) as fh:
+        header_line = fh.readline()
+    col_of: dict[str, int] = {}
+    for idx, cname, _unit in _COLUMN_RE.findall(header_line):
+        m = _PROBE_COL_RE.search(cname)
+        if m:
+            col_of[m.group(1)] = int(idx)
+        elif cname.strip().startswith("step"):
+            col_of["step"] = int(idx)
+        elif cname.strip().startswith("time"):
+            col_of["time"] = int(idx)
+    needed = {"step", "time", "x", "z"}
+    if not needed <= set(col_of):
+        raise ValueError(f"{path.name}: not a FieldProbe table (columns {sorted(col_of)})")
+
+    # loadtxt (C fast path) covers the normal single-header file; a restart
+    # can append another header mid-file, which only genfromtxt tolerates.
+    try:
+        arr = np.loadtxt(path, skiprows=1)
+    except ValueError:
+        with np.errstate(invalid="ignore"):
+            arr = np.genfromtxt(path, skip_header=1, invalid_raise=False)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    ok = np.isfinite(arr[:, [col_of["step"], col_of["time"], col_of["x"], col_of["z"]]]).all(axis=1)
+    arr = arr[ok]
+    if arr.shape[0] == 0:
+        return {}
+
+    steps = arr[:, col_of["step"]].astype(np.int64)
+    bounds = np.flatnonzero(np.diff(steps) != 0) + 1
+    blocks = np.split(np.arange(steps.size), bounds)
+    # one block per step, last occurrence wins (restart overlap); uniform
+    # probe count only — drop incomplete blocks (crash-truncated tail)
+    by_step: dict[int, np.ndarray] = {int(steps[b[0]]): b for b in blocks}
+    sizes = [b.size for b in by_step.values()]
+    counts = np.bincount(sizes)
+    n_pts = int(np.flatnonzero(counts == counts.max()).max())  # ties -> larger block
+    if n_pts < 2:
+        return {}
+    dropped = sum(1 for s in sizes if s != n_pts)
+    if dropped:
+        print(f"[post] {path.name}: dropped {dropped} incomplete probe blocks")
+    order = sorted(s for s, b in by_step.items() if b.size == n_pts)
+    if not order:
+        return {}
+
+    first = arr[by_step[order[0]]]
+    px, pz = first[:, col_of["x"]], first[:, col_of["z"]]
+    along_z = np.ptp(pz) > np.ptp(px)
+    vary_col, fixed_col = (col_of["z"], col_of["x"]) if along_z else (col_of["x"], col_of["z"])
+    axis = "x1" if along_z else "x2"  # OSIRIS axis the line runs along
+    fixed_axis = "x" if along_z else "z"
+    pos = np.sort(first[:, vary_col])
+    d_vary = float(np.median(np.diff(pos))) if n_pts > 1 else 1.0
+    fixed_si = float(np.median(first[:, fixed_col]))
+    cell = _probe_cell_index(fixed_si, fixed_axis, deck, d_vary)
+
+    nt = len(order)
+    t_si = np.empty(nt)
+    comps = (components or _PROBE_LINE_COMPONENTS)[axis]
+    osiris_to_probe = {v: k for k, v in _PROBE_COMP_TO_OSIRIS.items()}
+    data = {c: np.empty((nt, n_pts), dtype=_DIAG_DTYPE) for c in comps if osiris_to_probe[c] in col_of}
+    for it, s in enumerate(order):
+        block = arr[by_step[s]]
+        sortix = np.argsort(block[:, vary_col])
+        t_si[it] = float(block[0, col_of["time"]])
+        for c, out in data.items():
+            out[it] = block[sortix, col_of[osiris_to_probe[c]]]
+    if not data:
+        return {}
+
+    if units is not None:
+        t = t_si * units.wp0
+        x = pos / units.x0
+        scale = {"e": 1.0 / units.E0, "b": 1.0 / units.B0}
+        t_units, x_units = r"1/\omega_p", r"c / \omega_p"
+        f_units = {"e": r"m_e c \omega_p / e", "b": r"m_e \omega_p / e"}
+    else:
+        t, x = t_si, pos
+        scale = {"e": 1.0, "b": 1.0}
+        t_units, x_units = "s", "m"
+        f_units = {"e": "V/m", "b": "T"}
+
+    out: dict[str, xr.DataArray] = {}
+    for c, vals in data.items():
+        da = xr.DataArray(
+            (vals * scale[c[0]]).astype(_DIAG_DTYPE),
+            coords={"t": t, "iter": ("t", np.asarray(order, dtype=np.int64)), axis: x},
+            dims=["t", axis],
+            name=c,
+            attrs={
+                "long_name": f"{c[0]}_{c[1]}",
+                "units": f_units[c[0]],
+                "time_units": t_units,
+                "axis_units": {axis: x_units},
+                "axis_long_names": {axis: f"x_{axis[-1]}"},
+                "probe_fixed_cell": int(cell),
+                "probe_fixed_si": fixed_si,
+                "source": path.name,
+            },
+        )
+        out[f"FLD/{c}-line-{axis}-{cell:04d}"] = da
+    return out
+
+
 def _full_diag_dirs(run_dir: Path) -> list[Path]:
     """Full-diagnostic openPMD directories under ``diags/`` (skips reducedfiles)."""
     diags = run_dir / "diags"
@@ -1315,7 +1495,10 @@ def save_run_datasets(
     - ``HIST/energy.nc`` (the OSIRIS energy-history schema, from
       FieldEnergy + ParticleEnergy when present);
     - ``FLD/s1-line-x2-000{1,2}.nc`` (2D runs: derived entrance/exit
-      Poynting-flux lineouts, see :func:`save_s1_lineouts`).
+      Poynting-flux lineouts, see :func:`save_s1_lineouts`);
+    - ``FLD/<comp>-line-x{1,2}-<cell>.nc`` (FieldProbe Line reduced diags,
+      reshaped into OSIRIS-style high-cadence field lineouts — the F11/F12
+      inputs; see :func:`load_field_probe_lines`).
 
     The run's rendered ``inputs`` deck (when present) drives the routing:
     histogram functions, species names, bin ranges and charge signs come
@@ -1409,6 +1592,20 @@ def save_run_datasets(
     h2d_names = set(list_histogram2d_diags(run_dir))
     for name, path in list_reduced_diags(run_dir).items():
         if name in h2d_names or str(_deck_get(deck, f"{name}.type")) == "ParticleHistogram2D":
+            continue
+        # FieldProbe Line tables become OSIRIS-style FLD/<comp>-line-… series
+        # (long format; the generic REDUCED/ parser would mis-stack them).
+        if is_field_probe_table(path, deck=deck, name=name):
+            try:
+                for rel, da in load_field_probe_lines(path, units=units, deck=deck).items():
+                    if rel in taken:
+                        rel = f"{rel}-{name}"
+                    if not want(rel):
+                        continue
+                    write(series_to_dataset(da), rel)
+                    taken.add(rel)
+            except Exception as e:
+                print(f"[post] skipping FieldProbe lines from {name}: {e}")
             continue
         if is_particle_histogram_table(path, deck):
             rel = f"PHA/{name}/{_deck_species_of(deck, name)}"
