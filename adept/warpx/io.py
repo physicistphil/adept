@@ -815,13 +815,24 @@ def _species_charge_sign(deck: dict | None, species: str) -> float:
 
 
 def _ordinate_info(fn_ord: str | None) -> tuple[str, str, str]:
-    """``(dim, long_name, kind)`` for a histogram ordinate/bin function."""
+    """``(dim, long_name, kind)`` for a histogram axis (bin) function.
+
+    Classifies momentum (``uz/ux/uy`` → ``p1/p2/p3``, in m_e c), spatial
+    (``z/x/y`` → ``x1/x2/x3`` via the cyclic relabeling, meters → c/ω_p)
+    and ``log10(...)`` → ``gamma`` axes. Used for both the ordinate and —
+    since the p1p2 mislabeling fix (dev_docs/p2_bugfix.md) — the abscissa:
+    a momentum abscissa must NOT be named ``x1``/converted by ``x0``, or
+    the spatial box crop downstream blanks the phase space.
+    """
     s = (fn_ord or "").replace(" ", "")
     if "log10" in s:
         return "gamma", r"log_{10}\gamma", "log_gamma"
     for u, i in (("uz", "1"), ("ux", "2"), ("uy", "3")):
         if s == u:
             return f"p{i}", f"p_{i}", "momentum"
+    for u, i in (("z", "1"), ("x", "2"), ("y", "3")):
+        if s == u:
+            return f"x{i}", f"x_{i}", "spatial"
     return "ord", fn_ord or "ord", "other"
 
 
@@ -831,18 +842,29 @@ def _edge_style_axis(lo: float, hi: float, n: int) -> np.ndarray:
 
 
 def _box_attrs(deck: dict | None, units: CodeUnits | None) -> dict[str, Any]:
-    """``sim.XMIN/XMAX`` attrs (code units) from the deck geometry, if known."""
+    """``sim.XMIN/XMAX/NDIMS`` attrs (code units) from the deck geometry.
+
+    Ordered **x1-first** like the field converter (``sim.XMIN`` entry 0 is
+    the OSIRIS x1 = WarpX z axis): the deck's ``prob_lo/hi`` are WarpX
+    ``(x[, y], z)``-ordered, which is what let the transverse extent land in
+    slot 0 and crop the p1x1 phase space to 3 µm (dev_docs/p2_bugfix.md,
+    root cause 2 — the histogram-path twin of commit ``36a22ae``).
+    """
     lo = _deck_get(deck, "geometry.prob_lo")
     hi = _deck_get(deck, "geometry.prob_hi")
     if lo is None or hi is None:
         return {}
     lo = lo if isinstance(lo, list) else [lo]
     hi = hi if isinstance(hi, list) else [hi]
+    order = {1: [0], 2: [1, 0], 3: [2, 0, 1]}.get(len(lo))
+    if order is None:
+        return {}
     x0 = units.x0 if units is not None else 1.0
     try:
         return {
-            "sim.XMIN": [float(v) / x0 for v in lo],
-            "sim.XMAX": [float(v) / x0 for v in hi],
+            "sim.NDIMS": len(lo),
+            "sim.XMIN": [float(lo[i]) / x0 for i in order],
+            "sim.XMAX": [float(hi[i]) / x0 for i in order],
         }
     except (TypeError, ValueError):
         return {}
@@ -864,8 +886,10 @@ def load_particle_histogram2d(
 ) -> xr.DataArray:
     """Stack a ParticleHistogram2D history into an OSIRIS-style phase space.
 
-    Returns a ``(t, x1, <ord>)`` DataArray in code units (see the section
-    comment above for the normalization). The deck (the run's rendered
+    Returns a ``(t, <abs>, <ord>)`` DataArray in code units (see the section
+    comment above for the normalization) — both axes classified from the
+    deck's bin functions (``z → x1`` spatial, ``uz/ux → p1/p2`` momentum,
+    …), so a ``(uz, ux)`` histogram comes out ``(t, p1, p2)``. The deck (the run's rendered
     ``inputs``) supplies the abscissa/ordinate/value functions, the species
     and the bin ranges; without it the ranges fall back to the openPMD grid
     attrs and the deposit is treated as a count. Without ``units`` the raw
@@ -888,40 +912,48 @@ def load_particle_histogram2d(
         ax: (_deck_get(deck, f"{name}.bin_min_{ax}"), _deck_get(deck, f"{name}.bin_max_{ax}")) for ax in ("abs", "ord")
     }
 
-    slabs: list[np.ndarray] = []
-    times: list[float] = []
-    iters: list[int] = []
+    # A production history is large enough that the naive read-all-float64 /
+    # stack / scale pipeline transiently holds several full copies of the
+    # cube (an 11k-dump 1000x1024 history is ~96 GB in float64 alone, the
+    # srs-1d-ppc-scan postproc OOM). Read in two passes instead: index the
+    # iterations without holding pixel data, then fill a preallocated cube in
+    # the final float32 diag dtype — peak memory is the cube plus one slab.
+    def _meshes():
+        """Yield ``(iteration, group, mesh record)`` across all files."""
+        for path in files:
+            with h5py.File(path, "r") as f:
+                meshes_path = _decode(f.attrs.get("meshesPath", "meshes/")).strip("/")
+                for it, grp in _iteration_groups(f):
+                    meshes = grp.get(meshes_path)
+                    if meshes is None or not len(meshes.keys()):
+                        continue
+                    mesh_name = "data" if "data" in meshes else next(iter(meshes.keys()))
+                    yield int(it), grp, meshes[mesh_name]
+
+    index: list[tuple[int, float]] = []
+    shape: tuple[int, ...] | None = None
     grid_lo: np.ndarray | None = None
     grid_hi: np.ndarray | None = None
-    for path in files:
-        with h5py.File(path, "r") as f:
-            meshes_path = _decode(f.attrs.get("meshesPath", "meshes/")).strip("/")
-            for it, grp in _iteration_groups(f):
-                meshes = grp.get(meshes_path)
-                if meshes is None or not len(meshes.keys()):
-                    continue
-                mesh_name = "data" if "data" in meshes else next(iter(meshes.keys()))
-                rec = meshes[mesh_name]
-                comps = _record_components(rec)
-                arr, _unit_si = _read_component(next(iter(comps.values())))
-                arr = np.asarray(arr, dtype="float64")
-                if grid_lo is None:
-                    spacing = np.atleast_1d(rec.attrs.get("gridSpacing", [1.0] * arr.ndim)).astype(float)
-                    offset = np.atleast_1d(rec.attrs.get("gridGlobalOffset", [0.0] * arr.ndim)).astype(float)
-                    gu = float(rec.attrs.get("gridUnitSI", 1.0))
-                    grid_lo = offset * gu
-                    grid_hi = (offset + spacing * np.asarray(arr.shape, dtype=float)) * gu
-                slabs.append(arr)
-                t_si = float(grp.attrs.get("time", 0.0)) * float(grp.attrs.get("timeUnitSI", 1.0))
-                times.append(t_si)
-                iters.append(int(it))
-    if not slabs:
+    for it, grp, rec in _meshes():
+        if shape is None:
+            node = next(iter(_record_components(rec).values()))
+            if isinstance(node, h5py.Dataset):
+                shape = tuple(int(s) for s in node.shape)
+            else:  # constant record component: shape lives in the attrs
+                shape = tuple(int(s) for s in np.atleast_1d(node.attrs.get("shape", [1])))
+            spacing = np.atleast_1d(rec.attrs.get("gridSpacing", [1.0] * len(shape))).astype(float)
+            offset = np.atleast_1d(rec.attrs.get("gridGlobalOffset", [0.0] * len(shape))).astype(float)
+            gu = float(rec.attrs.get("gridUnitSI", 1.0))
+            grid_lo = offset * gu
+            grid_hi = (offset + spacing * np.asarray(shape, dtype=float)) * gu
+        t_si = float(grp.attrs.get("time", 0.0)) * float(grp.attrs.get("timeUnitSI", 1.0))
+        index.append((it, t_si))
+    if shape is None:
         raise FileNotFoundError(f"No histogram meshes found in {diag_dir}")
 
     # WarpX writes the dataset as (bin_number_ord, bin_number_abs); confirm
     # against the deck's bin counts when they are available (and transpose if
     # a future layout flips them), then reorder to (abs, ord).
-    shape = slabs[0].shape
     if len(shape) != 2:
         raise ValueError(f"{diag_dir}: expected a 2-D histogram mesh, got shape {shape}")
     ord_first = True
@@ -944,52 +976,74 @@ def load_particle_histogram2d(
     abs_lo, abs_hi = _range("abs", n_abs)
     ord_lo, ord_hi = _range("ord", n_ord)
 
-    order = np.argsort(iters, kind="stable")
-    stacked = np.stack([slabs[i].T if ord_first else slabs[i] for i in order])  # (t, abs, ord)
-    t = np.asarray(times, dtype="float64")[order]
-    its = np.asarray(iters, dtype="int64")[order]
+    order = np.argsort([it for it, _ in index], kind="stable")
+    t = np.asarray([ts for _, ts in index], dtype="float64")[order]
+    its = np.asarray([it for it, _ in index], dtype="int64")[order]
+
+    # Pass 2: fill the (t, abs, ord) cube row by row, float32 at read time.
+    rows = np.empty(len(index), dtype=np.int64)
+    rows[order] = np.arange(len(index))
+    data = np.empty((len(index), n_abs, n_ord), dtype=_DIAG_DTYPE)
+    for j, (_it, _grp, rec) in enumerate(_meshes()):
+        arr, _unit_si = _read_component(next(iter(_record_components(rec).values())))
+        slab = np.asarray(arr, dtype=_DIAG_DTYPE)
+        data[rows[j]] = slab.T if ord_first else slab
 
     ord_dim, ord_long, ord_kind = _ordinate_info(str(fn_ord) if fn_ord is not None else None)
+    # The abscissa goes through the same classifier (p2_bugfix.md root cause
+    # 1: a `uz` abscissa hard-named x1 and divided by x0 produced a fake
+    # spatial axis the box crop then blanked). No/unrecognized deck function
+    # keeps the legacy spatial-x1 reading (all 1D campaigns).
+    abs_dim, abs_long, abs_kind = _ordinate_info(str(fn_abs)) if fn_abs is not None else ("x1", "x_1", "spatial")
+    if abs_kind == "other":
+        abs_dim, abs_long, abs_kind = "x1", "x_1", "spatial"
     is_count = fn_val is not None and str(fn_val).strip() == "w"
     if fn_val is None:
         is_count = True  # no deck: assume a plain weight histogram
 
-    d_abs = (abs_hi - abs_lo) / max(n_abs, 1)  # SI (m for a spatial abscissa)
+    # bin widths in their native units (m for spatial, m_e c for momentum) —
+    # the count -> density normalization divides by the native-unit bin area
+    d_abs = (abs_hi - abs_lo) / max(n_abs, 1)
     d_ord = (ord_hi - ord_lo) / max(n_ord, 1)
     q_sign = _species_charge_sign(deck, species)
+    x_axis = _edge_style_axis(abs_lo, abs_hi, n_abs)
+    axis_kind_units = {
+        "spatial": (r"c / \omega_p", "m"),
+        "momentum": (r"m_e c", r"m_e c"),
+        "log_gamma": ("", ""),
+    }
     if units is not None:
         denom = d_abs * units.n0 * d_ord
         scale = (q_sign if is_count else 1.0) / denom if denom > 0 else 1.0
-        stacked = stacked * scale
+        data *= np.asarray(scale, dtype=_DIAG_DTYPE)  # in place — no float64 copy
         t = t * units.wp0
-        x_axis = _edge_style_axis(abs_lo, abs_hi, n_abs) / units.x0
-        x_units = r"c / \omega_p"
+        if abs_kind == "spatial":
+            x_axis = x_axis / units.x0
+        x_units = axis_kind_units.get(abs_kind, ("", ""))[0]
         val_units = r"n_0\,\Delta_{bins}^{-1}" if is_count else r"n_0 m_e c^3\,\Delta_{bins}^{-1}"
     else:
-        x_axis = _edge_style_axis(abs_lo, abs_hi, n_abs)
-        x_units = "m"
+        x_units = axis_kind_units.get(abs_kind, ("", ""))[1]
         val_units = "SI (raw per-bin sum)"
 
-    data = stacked.astype(_DIAG_DTYPE)
     ord_axis = _edge_style_axis(ord_lo, ord_hi, n_ord)
     ord_units = {"momentum": r"m_e c", "log_gamma": ""}.get(ord_kind, "")
 
-    coords: dict[str, Any] = {"t": t, "iter": ("t", its), "x1": x_axis, ord_dim: ord_axis}
+    coords: dict[str, Any] = {"t": t, "iter": ("t", its), abs_dim: x_axis, ord_dim: ord_axis}
     attrs: dict[str, Any] = {
         "long_name": name,
         "units": val_units,
         "time_units": r"1/\omega_p" if units is not None else "s",
-        "axis_units": {"x1": x_units, ord_dim: ord_units},
-        "axis_long_names": {"x1": "x_1", ord_dim: ord_long},
+        "axis_units": {abs_dim: x_units, ord_dim: ord_units},
+        "axis_long_names": {abs_dim: abs_long, ord_dim: ord_long},
         "source_dir": str(diag_dir),
         "warpx_species": species,
-        "sim.NDIMS": 1,
+        "sim.NDIMS": 1,  # geometry-aware override from _box_attrs below
     }
     for key, fn in (("warpx_function_abs", fn_abs), ("warpx_function_ord", fn_ord), ("warpx_value_function", fn_val)):
         if fn is not None:
             attrs[key] = str(fn)
     attrs.update(_box_attrs(deck, units))
-    return xr.DataArray(data, coords=coords, dims=("t", "x1", ord_dim), name=name, attrs=attrs)
+    return xr.DataArray(data, coords=coords, dims=("t", abs_dim, ord_dim), name=name, attrs=attrs)
 
 
 _BIN_HEADER_RE = re.compile(r"^bin(\d+)=(.+)$")
