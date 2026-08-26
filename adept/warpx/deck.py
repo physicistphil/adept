@@ -241,6 +241,11 @@ def merge_overrides(deck: Deck, overrides: dict[str, Any]) -> None:
 
     Unknown keys are appended — WarpX ignores unused parameters, and a new key
     (e.g. an extra reduced diagnostic parameter) is a legitimate override.
+
+    Values are TYPED, not deck text: a multi-valued ParmParse parameter must be
+    a list (``"warpx.numprocs": [2, 16]`` renders as ``= 2 16``). The string
+    ``"2 16"`` renders *quoted* (strings with whitespace must be re-quoted to
+    round-trip) and makes WarpX abort at startup in ``ReadParameters``.
     """
     for k, v in (overrides or {}).items():
         deck[_find_deck_key(deck, k)] = v

@@ -71,6 +71,15 @@ warpx:
 - Unknown keys are appended — WarpX ignores unused parameters, and a new key (e.g. an extra
   diagnostic) is a legitimate override.
 - List values are rendered space-separated, matching ParmParse syntax.
+- **Multi-valued parameters must be YAML lists, not strings.** The override's YAML type
+  selects the ParmParse type: `warpx.numprocs: [2, 16]` renders as `= 2 16` (an int
+  array), while `warpx.numprocs: "2 16"` is a *string* and renders **quoted** (`= "2 16"`,
+  one token — strings with whitespace must be re-quoted to survive the parse/render round
+  trip), which makes WarpX abort at startup inside `ReadParameters`
+  (`queryArrWithParser`). Nothing validates an override's type against the deck value it
+  replaces, and the launcher records the solver exit code as a metric rather than failing
+  the job — so the symptom is a "successful" job that ended suspiciously fast, with
+  `Backtrace.*` files in the run dir.
 
 The post-override deck is what runs, is logged key-by-key to MLflow (under `deck.*`), and is
 archived as the `inputs` artifact; WarpX's own `warpx_used_inputs` is archived too for provenance.
@@ -89,11 +98,45 @@ Optional block controlling post-processing, mirroring the OSIRIS wrapper:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `diagnostics_to_log` | list[string] | Whitelist of diagnostics to convert/upload, matched on the contract key (`FLD/e1`) or its leaf name (`e1`). Default: everything. |
+| `diagnostics_to_log` | list[string] | Whitelist of diagnostics to convert/upload, matched on the contract key (`FLD/e1`) or its leaf name (`e1`). Default: everything. **Gates conversion, not just upload — see the warning below.** |
 | `v_th` | float | Electron thermal velocity (units of c) for the Langmuir/Bohm–Gross overlay on ω–k plots |
 | `omega_k_zoom` | float \| null | `(k, ω)` half-width for the equal-aspect lower ω–k panel (`null` → full Nyquist) |
 | `overlay_density` | float | Density (units of `reference_density`) at which dispersion overlays are evaluated (`ω_p = sqrt(n)`) |
 | `bam` | bool | Shade the beam-acoustic-mode band on ω–k plots (needs `v_th`) |
+
+```{warning}
+`diagnostics_to_log` is passed straight to
+{func}`adept.warpx.io.save_run_datasets` as its `diagnostics=` argument, so a
+non-whitelisted diagnostic is **never written into `binary/`** — it is not
+merely withheld from the MLflow upload. Every downstream consumer reads
+`binary/`, so using this field to keep bulk off the tracking server also
+disables the analyses that depend on it.
+
+Excluding the full-field maps (`FLD/e1`…`b3`, `DENSITY/*`) on a **2D** run
+silently removes: the `srs2d` bundle figures (F1–F9 — `bundle2d` is on by
+default and simply gets no input), `energy_vs_time` /
+`energy_components_vs_time` / `epw_energy_vs_time`, the non-native
+`epw_growth_rate`, and the k-t spectrogram. It also makes `warpx_lpi.native`
+fall back to the 1-D Poynting normalization — it reads the transverse box
+width off a converted 2-D `FLD/*.nc` — yielding a spurious
+`laser_reflectivity_poynting` ≈ −1.
+
+Unaffected: `PHA/*`, `REDUCED/*`, `HIST/*`, and the FieldProbe line series
+`FLD/<comp>-line-*`, which are one-dimensional in space. Note that each line
+series is its own contract key, so whitelisting `e2` does **not** carry
+`e2-line-x2-0024` along with it.
+```
+
+```{note}
+The boundary-light products — the dump-cadence laser energy budget
+(`laser_reflectivity`, `laser_transmissivity`, `laser_absorbed_frac`), the EM
+boundary-light spectrum, and its spectrogram — are **absent on any 2D run
+regardless of this whitelist**. They are built by
+{func}`adept.osiris.plots.transverse_field_boundary_slabs`, which loads a
+candidate field only when `ser.ndim == 2`; a converted 2-D map is
+`(t, x2, x1)`, so no pair is ever formed and the caller reports *"no transverse
+field pairs (need e2/b3 or e3/b2)"*. Widening the whitelist will not fix this.
+```
 
 ## Post-processing artifacts
 
