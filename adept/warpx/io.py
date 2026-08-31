@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -320,6 +321,17 @@ def _component_stagger(node: h5py.Dataset | h5py.Group) -> np.ndarray:
     return np.atleast_1d(node.attrs.get("position", [0.0])).astype(float)
 
 
+class _NonMonotonicIterations(Exception):
+    """Raised mid-walk when a series' file order is not iteration order.
+
+    An append-only writer cannot reorder, so the streaming converters catch
+    this and restart on the eager path. No openPMD file-based series WarpX
+    produces triggers it (``_openpmd_files`` sorts on the filename iteration
+    index and ``_iteration_groups`` sorts within a file), but the eager
+    result is correct either way.
+    """
+
+
 def list_field_records(diag_dir: str | Path) -> list[tuple[str, str | None]]:
     """``(mesh, component)`` pairs present in a full diagnostic's first dump."""
     diag_dir = Path(diag_dir)
@@ -339,6 +351,333 @@ def list_field_records(diag_dir: str | Path) -> list[tuple[str, str | None]]:
     return out
 
 
+@dataclass
+class _FieldRecordPlan:
+    """One mesh component's OSIRIS-side identity, from the first dump alone.
+
+    The axes, code-unit scaling, ``binary/`` key and storage-order transpose
+    are all fixed by the first file's grid metadata plus the deck-independent
+    ``_mesh_diag_key`` mapping — no pixel data and no walk of the history.
+    That is what lets :func:`convert_field_series_streaming` decide *what to
+    write and where* before opening a single dump, so the whitelist can skip
+    records instead of loading and discarding them.
+
+    ``perm`` reorders an openPMD-order slab into ``dims`` (OSIRIS stores
+    multi-D as ``(t, …, x2, x1)``); it is the identity in 1D and 2D XZ.
+    """
+
+    mesh: str
+    comp: str | None
+    rel: str
+    name: str
+    dims: tuple[str, ...]
+    perm: tuple[int, ...]
+    coords: dict[str, np.ndarray]
+    attrs: dict[str, Any]
+    scale: float
+
+
+def _field_plan(
+    diag_dir: str | Path,
+    *,
+    units: CodeUnits | None = None,
+) -> tuple[str, list[_FieldRecordPlan]]:
+    """``(meshes_path, plans)`` for every record in a full diagnostic.
+
+    Costs **one** file open regardless of history length.
+    """
+    diag_dir = Path(diag_dir)
+    files = _openpmd_files(diag_dir)
+    if not files:
+        raise FileNotFoundError(f"No openpmd_*.h5 files in {diag_dir}")
+
+    plans: list[_FieldRecordPlan] = []
+    with h5py.File(files[0], "r") as f:
+        meshes_path = _decode(f.attrs.get("meshesPath", "fields/")).strip("/")
+        groups = _iteration_groups(f)[:1]
+        if not groups:
+            raise FileNotFoundError(f"No iteration groups in {files[0]}")
+        meshes = groups[0][1].get(meshes_path)
+        if meshes is None:
+            raise FileNotFoundError(f"No meshes under {meshes_path!r} in {files[0]}")
+        for mesh in meshes.keys():
+            rec = meshes[mesh]
+            for comp, node in _record_components(rec).items():
+                if isinstance(node, h5py.Dataset):
+                    shape = tuple(int(s) for s in node.shape)
+                else:  # constant record component
+                    shape = tuple(int(s) for s in np.atleast_1d(node.attrs.get("shape", [1])))
+                unit_si = float(node.attrs.get("unitSI", 1.0))
+
+                axes = _mesh_axes(rec, shape)
+                stag = _component_stagger(node)
+                for d, ax in enumerate(axes):
+                    s = stag[d] if d < stag.size else 0.0
+                    ax["coords"] = ax["coords"] + s * ax["spacing"]
+                cartesian = all(ax["label"] in _AXIS_TO_OSIRIS for ax in axes)
+
+                key_info = _mesh_diag_key(mesh, comp, cartesian)
+                if key_info is not None:
+                    rel, info = key_info
+                    scale = getattr(units, info["scale"]) if units is not None else 1.0
+                    name, long_name, val_units = info["name"], info["long_name"], info["units"]
+                else:
+                    scale = 1.0
+                    name = mesh if comp is None else f"{mesh}{comp}"
+                    long_name = name
+                    val_units = "SI"
+                    rel = f"FLD/{name}"
+                if units is None:
+                    val_units = "SI"
+
+                dims_native: list[str] = []
+                coords: dict[str, np.ndarray] = {}
+                axis_units: dict[str, str] = {}
+                axis_long: dict[str, str] = {}
+                extents: list[tuple[str, float, float, int]] = []
+                for ax in axes:
+                    if cartesian:
+                        dim = _AXIS_TO_OSIRIS[ax["label"]]
+                        axis_long[dim] = f"x_{dim[1:]}"
+                    else:
+                        dim = ax["label"]
+                        axis_long[dim] = ax["label"]
+                    cv = np.asarray(ax["coords"], dtype="float64")
+                    if units is not None:
+                        cv = cv / units.x0
+                        axis_units[dim] = r"c / \omega_p"
+                    else:
+                        axis_units[dim] = "m"
+                    coords[dim] = cv
+                    dims_native.append(dim)
+                    extents.append((dim, float(cv[0]), float(cv[-1]), int(cv.size)))
+                # sim.XMIN/XMAX/NX are indexed by the OSIRIS axis number
+                # (x1 -> entry 0), so order them x1, x2, … regardless of the
+                # openPMD axis order.
+                if cartesian:
+                    extents.sort(key=lambda e: e[0])
+
+                # OSIRIS multi-D storage order: (t, …, x2, x1).
+                dims = sorted(dims_native, reverse=True) if cartesian and len(dims_native) > 1 else list(dims_native)
+                perm = tuple(dims_native.index(d) for d in dims)
+
+                attrs = {
+                    "long_name": long_name,
+                    "units": val_units,
+                    "time_units": r"1/\omega_p" if units is not None else "s",
+                    "axis_units": axis_units,
+                    "axis_long_names": axis_long,
+                    "source_dir": str(diag_dir),
+                    "warpx_record": mesh if comp is None else f"{mesh}/{comp}",
+                    "unit_si": unit_si * (float(np.asarray(scale)) if units is not None else 1.0),
+                    "sim.NDIMS": len(axes),
+                    "sim.XMIN": [e[1] for e in extents],
+                    "sim.XMAX": [e[2] for e in extents],
+                    "sim.NX": [e[3] for e in extents],
+                }
+                plans.append(
+                    _FieldRecordPlan(
+                        mesh=mesh,
+                        comp=comp,
+                        rel=rel,
+                        name=name,
+                        dims=tuple(dims),
+                        perm=perm,
+                        coords=coords,
+                        attrs=attrs,
+                        scale=float(np.asarray(scale)) if units is not None else 1.0,
+                    )
+                )
+    return meshes_path, plans
+
+
+def _field_slab(plan: _FieldRecordPlan, node, *, scaled: bool) -> np.ndarray:
+    """One dump of one record, in OSIRIS storage order and float32."""
+    arr, _unit_si = _read_component(node)
+    slab = np.asarray(arr, dtype=_DIAG_DTYPE)
+    if scaled and plan.scale != 1.0:
+        slab = slab / np.asarray(plan.scale, dtype=_DIAG_DTYPE)
+    if plan.perm != tuple(range(slab.ndim)):
+        slab = slab.transpose(plan.perm)
+    return np.ascontiguousarray(slab)
+
+
+def _field_records(
+    diag_dir: Path,
+    meshes_path: str,
+    plans: list[_FieldRecordPlan],
+    *,
+    units: CodeUnits | None,
+    require_monotonic: bool = False,
+    skip: set[str] | None = None,
+    on_error: Any = None,
+) -> Iterator[tuple[int, float, dict[str, np.ndarray]]]:
+    """Walk the files **once**, yielding ``(iteration, time, {plan.rel: slab})``.
+
+    Every requested record comes out of the *same* file open. The per-record
+    loop it replaces re-walked the whole tree once per component — 7 passes
+    over 87,780 files at a 2-omega_0-Nyquist field cadence, ~67 min of pure
+    open overhead at the ~6.5 ms/file measured on Perlmutter's Lustre.
+
+    ``skip`` (a live set of ``plan.rel``) is consulted every dump and lets a
+    caller retire a record mid-walk; with ``on_error`` a failed record is
+    reported and retired instead of aborting the walk, which is how the
+    single pass keeps the per-record failure isolation of the loop it
+    replaces. Without ``on_error`` a read failure propagates.
+    """
+    t_scale = units.wp0 if units is not None else 1.0
+    last_it = -(1 << 62)
+    for path in _openpmd_files(diag_dir):
+        with h5py.File(path, "r") as f:
+            for it, grp in _iteration_groups(f):
+                meshes = grp.get(meshes_path)
+                if meshes is None:
+                    continue
+                if require_monotonic and it <= last_it:
+                    raise _NonMonotonicIterations(f"{diag_dir}: iteration {it} follows {last_it}")
+                last_it = it
+                t_si = float(grp.attrs.get("time", 0.0)) * float(grp.attrs.get("timeUnitSI", 1.0))
+                slabs: dict[str, np.ndarray] = {}
+                for plan in plans:
+                    if skip is not None and plan.rel in skip:
+                        continue
+                    rec = meshes.get(plan.mesh)
+                    if rec is None:
+                        continue
+                    comps = _record_components(rec)
+                    if plan.comp not in comps:
+                        continue
+                    try:
+                        slabs[plan.rel] = _field_slab(plan, comps[plan.comp], scaled=units is not None)
+                    except Exception as e:
+                        if on_error is None:
+                            raise
+                        on_error(plan.rel, int(it), e)
+                        if skip is not None:
+                            skip.add(plan.rel)
+                if slabs:
+                    yield int(it), t_si * t_scale, slabs
+
+
+def _field_slab_da(plan: _FieldRecordPlan, it: int, t: float, slab: np.ndarray) -> xr.DataArray:
+    """One dump of one record as a DataArray in the StreamWriter's contract."""
+    return xr.DataArray(
+        slab,
+        coords={d: plan.coords[d] for d in plan.dims},
+        dims=plan.dims,
+        name=plan.name,
+        attrs={**plan.attrs, "time": float(t), "iter": int(it)},
+    )
+
+
+def convert_field_series_streaming(
+    diag_dir: str | Path,
+    targets: list[tuple[str, _FieldRecordPlan]],
+    out_dir: str | Path,
+    *,
+    units: CodeUnits | None = None,
+    meshes_path: str = "fields",
+    complevel: int = 4,
+) -> list[Path]:
+    """Convert several field records to NetCDF in **one** walk of the dumps.
+
+    ``targets`` pairs each record's ``binary/`` key (already disambiguated
+    against keys other diagnostics took) with its
+    :class:`_FieldRecordPlan`. One :class:`~adept.osiris.stream.StreamWriter`
+    is held open per target and fed a slab at a time, so:
+
+    - each file is opened once instead of once per component;
+    - peak memory is one slab per target plus their ~1 MiB write batches,
+      against :func:`load_field_series`'s list-of-float64-slabs then
+      ``np.stack`` (~6.3 GB per component at 87,780 dumps of 3594 cells,
+      and far worse in 2D);
+    - the caller's whitelist skips records *before* they are read.
+
+    A record whose read fails is dropped (logged once) and the rest continue,
+    preserving the per-record isolation of the loop this replaces. An
+    out-of-order iteration falls back to the per-record eager path.
+    Returns the written paths.
+    """
+    from adept.osiris.stream import StreamWriter
+
+    diag_dir = Path(diag_dir)
+    out_dir = Path(out_dir)
+    if not targets:
+        return []
+
+    def _dest(rel: str) -> Path:
+        p = out_dir / f"{rel}.nc"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _eager() -> list[Path]:
+        from adept.osiris.io import series_to_dataset
+
+        done: list[Path] = []
+        for rel, plan in targets:
+            try:
+                da = load_field_series(diag_dir, plan.mesh, plan.comp, units=units)
+                ds = series_to_dataset(da)
+                dest = _dest(rel)
+                ds.to_netcdf(
+                    dest,
+                    engine="h5netcdf",
+                    encoding={n: {"zlib": True, "complevel": complevel, "shuffle": True} for n in ds.data_vars},
+                )
+                done.append(dest)
+            except Exception as e:
+                print(f"[post] skipping {rel} from {diag_dir.name}: {e}")
+        return done
+
+    for rel, _plan in targets:
+        # Never resume into a partial file left by a killed postproc.
+        _dest(rel).unlink(missing_ok=True)
+
+    writers: dict[str, Any] = {}
+    by_plan = {plan.rel: (rel, plan) for rel, plan in targets}
+    dropped: set[str] = set()
+
+    def _drop(plan_rel: str, it: int, exc: Exception) -> None:
+        rel, _plan = by_plan[plan_rel]
+        print(f"[post] dropping {rel} from {diag_dir.name} at iteration {it}: {exc}")
+        w = writers.pop(rel, None)
+        if w is not None:
+            w.close()
+        _dest(rel).unlink(missing_ok=True)
+
+    try:
+        for it, t, slabs in _field_records(
+            diag_dir,
+            meshes_path,
+            [p for _r, p in targets],
+            units=units,
+            require_monotonic=True,
+            skip=dropped,
+            on_error=_drop,
+        ):
+            for plan_rel, slab in slabs.items():
+                rel, plan = by_plan[plan_rel]
+                try:
+                    da = _field_slab_da(plan, it, t, slab)
+                    if rel not in writers:
+                        writers[rel] = StreamWriter(_dest(rel), da, source_dir=diag_dir, complevel=complevel)
+                    writers[rel].append(da)
+                except Exception as e:  # one bad record must not abort the rest
+                    _drop(plan_rel, it, e)
+                    dropped.add(plan_rel)
+    except _NonMonotonicIterations:
+        for w in writers.values():
+            w.close()
+        writers.clear()
+        for rel, _plan in targets:
+            _dest(rel).unlink(missing_ok=True)
+        return _eager()
+    finally:
+        for w in writers.values():
+            w.close()
+    return [_dest(rel) for rel, plan in targets if plan.rel not in dropped and _dest(rel).exists()]
+
+
 def load_field_series(
     diag_dir: str | Path,
     mesh: str,
@@ -356,113 +695,37 @@ def load_field_series(
     ``x → x2``, ``y → x3``), coords ``t``/``iter``, attrs ``axis_units`` /
     ``sim.XMIN`` (ordered ``x1, x2, …``) — so downstream plotting treats it
     like any OSIRIS diagnostic. RZ axes keep their native labels.
+
+    Stacks the whole history in memory, one record per call. The converter
+    uses :func:`convert_field_series_streaming` instead, which writes every
+    record of a diagnostic in a single walk; this stays the reference
+    implementation and the interactive entry point.
     """
     diag_dir = Path(diag_dir)
-    files = _openpmd_files(diag_dir)
-    if not files:
-        raise FileNotFoundError(f"No openpmd_*.h5 files in {diag_dir}")
+    meshes_path, plans = _field_plan(diag_dir, units=units)
+    plan = next((p for p in plans if p.mesh == mesh and p.comp == comp), None)
+    if plan is None:
+        present = sorted((p.mesh, p.comp) for p in plans)
+        raise KeyError(f"component {comp!r} not in mesh {mesh!r} ({present})")
 
     slabs: list[np.ndarray] = []
     times: list[float] = []
     iters: list[int] = []
-    axes: list[dict] | None = None
-    unit_si = 1.0
-    cartesian = True
-    for path in files:
-        with h5py.File(path, "r") as f:
-            meshes_path = _decode(f.attrs.get("meshesPath", "fields/")).strip("/")
-            for it, grp in _iteration_groups(f):
-                meshes = grp.get(meshes_path)
-                if meshes is None or mesh not in meshes:
-                    continue
-                rec = meshes[mesh]
-                comps = _record_components(rec)
-                if comp not in comps:
-                    raise KeyError(f"component {comp!r} not in mesh {mesh!r} ({sorted(comps)})")
-                arr, unit_si = _read_component(comps[comp])
-                if axes is None:
-                    axes = _mesh_axes(rec, arr.shape)
-                    stag = _component_stagger(comps[comp])
-                    for d, ax in enumerate(axes):
-                        s = stag[d] if d < stag.size else 0.0
-                        ax["coords"] = ax["coords"] + s * ax["spacing"]
-                    cartesian = all(ax["label"] in _AXIS_TO_OSIRIS for ax in axes)
-                slabs.append(np.asarray(arr))
-                t_si = float(grp.attrs.get("time", 0.0)) * float(grp.attrs.get("timeUnitSI", 1.0))
-                times.append(t_si)
-                iters.append(int(it))
-    if not slabs or axes is None:
+    for it, t, got in _field_records(diag_dir, meshes_path, [plan], units=units):
+        slabs.append(got[plan.rel])
+        times.append(t)
+        iters.append(it)
+    if not slabs:
         raise FileNotFoundError(f"mesh {mesh!r} (comp {comp!r}) not found in {diag_dir}")
 
     order = np.argsort(iters, kind="stable")
-    data = np.stack([slabs[i] for i in order]).astype(_DIAG_DTYPE)
-    t = np.asarray(times, dtype="float64")[order]
-    its = np.asarray(iters, dtype="int64")[order]
-
-    key_info = _mesh_diag_key(mesh, comp, cartesian)
-    if key_info is not None:
-        _rel, info = key_info
-        scale = getattr(units, info["scale"]) if units is not None else 1.0
-        name, long_name, val_units = info["name"], info["long_name"], info["units"]
-    else:
-        scale = 1.0
-        name = mesh if comp is None else f"{mesh}{comp}"
-        long_name = name
-        val_units = "SI"
-    if units is not None:
-        data = data / np.asarray(scale, dtype=_DIAG_DTYPE)
-        t = t * units.wp0
-    else:
-        val_units = "SI"
-
-    coords: dict[str, Any] = {"t": t, "iter": ("t", its)}
-    dims = ["t"]
-    axis_units: dict[str, str] = {}
-    axis_long: dict[str, str] = {}
-    extents: list[tuple[str, float, float, int]] = []
-    for ax in axes:
-        if cartesian:
-            dim = _AXIS_TO_OSIRIS[ax["label"]]
-            axis_long[dim] = f"x_{dim[1:]}"
-        else:
-            dim = ax["label"]
-            axis_long[dim] = ax["label"]
-        cv = np.asarray(ax["coords"], dtype="float64")
-        if units is not None:
-            cv = cv / units.x0
-            axis_units[dim] = r"c / \omega_p"
-        else:
-            axis_units[dim] = "m"
-        coords[dim] = cv
-        dims.append(dim)
-        extents.append((dim, float(cv[0]), float(cv[-1]), int(cv.size)))
-    # sim.XMIN/XMAX/NX are indexed by the OSIRIS axis number (x1 -> entry 0),
-    # so order them x1, x2, … regardless of the openPMD axis order.
-    if cartesian:
-        extents.sort(key=lambda e: e[0])
-    xmin = [e[1] for e in extents]
-    xmax = [e[2] for e in extents]
-    nx = [e[3] for e in extents]
-
-    attrs = {
-        "long_name": long_name,
-        "units": val_units,
-        "time_units": r"1/\omega_p" if units is not None else "s",
-        "axis_units": axis_units,
-        "axis_long_names": axis_long,
-        "source_dir": str(diag_dir),
-        "warpx_record": mesh if comp is None else f"{mesh}/{comp}",
-        "unit_si": float(unit_si) * (float(np.asarray(scale)) if units is not None else 1.0),
-        "sim.NDIMS": len(axes),
-        "sim.XMIN": xmin,
-        "sim.XMAX": xmax,
-        "sim.NX": nx,
+    data = np.stack([slabs[i] for i in order])
+    coords: dict[str, Any] = {
+        "t": np.asarray(times, dtype="float64")[order],
+        "iter": ("t", np.asarray(iters, dtype="int64")[order]),
     }
-    da = xr.DataArray(data, coords=coords, dims=dims, name=name, attrs=attrs)
-    if cartesian and len(dims) > 2:
-        # OSIRIS multi-D storage order: (t, …, x2, x1).
-        da = da.transpose("t", *sorted(dims[1:], reverse=True))
-    return da
+    coords.update({d: plan.coords[d] for d in plan.dims})
+    return xr.DataArray(data, coords=coords, dims=("t", *plan.dims), name=plan.name, attrs=dict(plan.attrs))
 
 
 def load_particle_species(
@@ -764,6 +1027,14 @@ def hist_energy_from_reduced(run_dir: str | Path, units: CodeUnits | None = None
 # The ordinate dim is named from the deck's ``histogram_function_ord``:
 # ``log10(...)`` → ``gamma`` (the OSIRIS log-gamma axis), a bare ``uz``/``ux``/
 # ``uy`` → ``p1``/``p2``/``p3`` (the cyclic mapping), anything else → ``ord``.
+#
+# Conversion runs in two passes over the openPMD files: :func:`_histogram2d_plan`
+# indexes the iterations and derives every axis/attr while holding no pixel
+# data, then :func:`_histogram2d_slabs` yields one scaled float32 slab per
+# dump. :func:`convert_histogram2d_streaming` feeds those slabs straight to the
+# OSIRIS ``StreamWriter``, so a history is never stacked in memory;
+# :func:`load_particle_histogram2d` fills the whole cube and is for callers
+# that want the array.
 
 
 def _deck_for_run(run_dir: str | Path) -> dict | None:
@@ -878,23 +1149,50 @@ def list_histogram2d_diags(run_dir: str | Path) -> dict[str, Path]:
     return {d.name: d for d in sorted(reduced.iterdir()) if d.is_dir() and _openpmd_files(d)}
 
 
-def load_particle_histogram2d(
+@dataclass
+class _Histogram2DGeometry:
+    """A ParticleHistogram2D's axes, attrs and scaling, from its first dump.
+
+    Everything needed to convert the series is fixed by the deck and the
+    first file's grid metadata, so this costs **one** file open regardless of
+    history length. ``_histogram2d_records`` then walks the files once to
+    produce the slabs — the whole conversion is a single pass over the tree.
+    """
+
+    diag_dir: Path
+    name: str
+    n_abs: int
+    n_ord: int
+    ord_first: bool
+    scale: float | None
+    t_scale: float
+    abs_dim: str
+    ord_dim: str
+    x_axis: np.ndarray
+    ord_axis: np.ndarray
+    attrs: dict[str, Any]
+
+
+def _histogram2d_meshes(files: list[Path]) -> Iterator[tuple[int, Any, Any]]:
+    """Yield ``(iteration, group, mesh record)`` across all files, in order."""
+    for path in files:
+        with h5py.File(path, "r") as f:
+            meshes_path = _decode(f.attrs.get("meshesPath", "meshes/")).strip("/")
+            for it, grp in _iteration_groups(f):
+                meshes = grp.get(meshes_path)
+                if meshes is None or not len(meshes.keys()):
+                    continue
+                mesh_name = "data" if "data" in meshes else next(iter(meshes.keys()))
+                yield int(it), grp, meshes[mesh_name]
+
+
+def _histogram2d_geometry(
     diag_dir: str | Path,
     *,
     units: CodeUnits | None = None,
     deck: dict | None = None,
-) -> xr.DataArray:
-    """Stack a ParticleHistogram2D history into an OSIRIS-style phase space.
-
-    Returns a ``(t, <abs>, <ord>)`` DataArray in code units (see the section
-    comment above for the normalization) — both axes classified from the
-    deck's bin functions (``z → x1`` spatial, ``uz/ux → p1/p2`` momentum,
-    …), so a ``(uz, ux)`` histogram comes out ``(t, p1, p2)``. The deck (the run's rendered
-    ``inputs``) supplies the abscissa/ordinate/value functions, the species
-    and the bin ranges; without it the ranges fall back to the openPMD grid
-    attrs and the deposit is treated as a count. Without ``units`` the raw
-    per-bin SI sums are returned unscaled.
-    """
+) -> _Histogram2DGeometry:
+    """Derive a ParticleHistogram2D's axes/attrs/scaling from its first dump."""
     diag_dir = Path(diag_dir)
     files = _openpmd_files(diag_dir)
     if not files:
@@ -912,42 +1210,21 @@ def load_particle_histogram2d(
         ax: (_deck_get(deck, f"{name}.bin_min_{ax}"), _deck_get(deck, f"{name}.bin_max_{ax}")) for ax in ("abs", "ord")
     }
 
-    # A production history is large enough that the naive read-all-float64 /
-    # stack / scale pipeline transiently holds several full copies of the
-    # cube (an 11k-dump 1000x1024 history is ~96 GB in float64 alone, the
-    # srs-1d-ppc-scan postproc OOM). Read in two passes instead: index the
-    # iterations without holding pixel data, then fill a preallocated cube in
-    # the final float32 diag dtype — peak memory is the cube plus one slab.
-    def _meshes():
-        """Yield ``(iteration, group, mesh record)`` across all files."""
-        for path in files:
-            with h5py.File(path, "r") as f:
-                meshes_path = _decode(f.attrs.get("meshesPath", "meshes/")).strip("/")
-                for it, grp in _iteration_groups(f):
-                    meshes = grp.get(meshes_path)
-                    if meshes is None or not len(meshes.keys()):
-                        continue
-                    mesh_name = "data" if "data" in meshes else next(iter(meshes.keys()))
-                    yield int(it), grp, meshes[mesh_name]
-
-    index: list[tuple[int, float]] = []
     shape: tuple[int, ...] | None = None
     grid_lo: np.ndarray | None = None
     grid_hi: np.ndarray | None = None
-    for it, grp, rec in _meshes():
-        if shape is None:
-            node = next(iter(_record_components(rec).values()))
-            if isinstance(node, h5py.Dataset):
-                shape = tuple(int(s) for s in node.shape)
-            else:  # constant record component: shape lives in the attrs
-                shape = tuple(int(s) for s in np.atleast_1d(node.attrs.get("shape", [1])))
-            spacing = np.atleast_1d(rec.attrs.get("gridSpacing", [1.0] * len(shape))).astype(float)
-            offset = np.atleast_1d(rec.attrs.get("gridGlobalOffset", [0.0] * len(shape))).astype(float)
-            gu = float(rec.attrs.get("gridUnitSI", 1.0))
-            grid_lo = offset * gu
-            grid_hi = (offset + spacing * np.asarray(shape, dtype=float)) * gu
-        t_si = float(grp.attrs.get("time", 0.0)) * float(grp.attrs.get("timeUnitSI", 1.0))
-        index.append((it, t_si))
+    for _it, _grp, rec in _histogram2d_meshes(files[:1]):
+        node = next(iter(_record_components(rec).values()))
+        if isinstance(node, h5py.Dataset):
+            shape = tuple(int(s) for s in node.shape)
+        else:  # constant record component: shape lives in the attrs
+            shape = tuple(int(s) for s in np.atleast_1d(node.attrs.get("shape", [1])))
+        spacing = np.atleast_1d(rec.attrs.get("gridSpacing", [1.0] * len(shape))).astype(float)
+        offset = np.atleast_1d(rec.attrs.get("gridGlobalOffset", [0.0] * len(shape))).astype(float)
+        gu = float(rec.attrs.get("gridUnitSI", 1.0))
+        grid_lo = offset * gu
+        grid_hi = (offset + spacing * np.asarray(shape, dtype=float)) * gu
+        break
     if shape is None:
         raise FileNotFoundError(f"No histogram meshes found in {diag_dir}")
 
@@ -976,19 +1253,6 @@ def load_particle_histogram2d(
     abs_lo, abs_hi = _range("abs", n_abs)
     ord_lo, ord_hi = _range("ord", n_ord)
 
-    order = np.argsort([it for it, _ in index], kind="stable")
-    t = np.asarray([ts for _, ts in index], dtype="float64")[order]
-    its = np.asarray([it for it, _ in index], dtype="int64")[order]
-
-    # Pass 2: fill the (t, abs, ord) cube row by row, float32 at read time.
-    rows = np.empty(len(index), dtype=np.int64)
-    rows[order] = np.arange(len(index))
-    data = np.empty((len(index), n_abs, n_ord), dtype=_DIAG_DTYPE)
-    for j, (_it, _grp, rec) in enumerate(_meshes()):
-        arr, _unit_si = _read_component(next(iter(_record_components(rec).values())))
-        slab = np.asarray(arr, dtype=_DIAG_DTYPE)
-        data[rows[j]] = slab.T if ord_first else slab
-
     ord_dim, ord_long, ord_kind = _ordinate_info(str(fn_ord) if fn_ord is not None else None)
     # The abscissa goes through the same classifier (p2_bugfix.md root cause
     # 1: a `uz` abscissa hard-named x1 and divided by x0 produced a fake
@@ -1012,11 +1276,12 @@ def load_particle_histogram2d(
         "momentum": (r"m_e c", r"m_e c"),
         "log_gamma": ("", ""),
     }
+    scale: float | None = None
+    t_scale = 1.0
     if units is not None:
         denom = d_abs * units.n0 * d_ord
         scale = (q_sign if is_count else 1.0) / denom if denom > 0 else 1.0
-        data *= np.asarray(scale, dtype=_DIAG_DTYPE)  # in place — no float64 copy
-        t = t * units.wp0
+        t_scale = units.wp0
         if abs_kind == "spatial":
             x_axis = x_axis / units.x0
         x_units = axis_kind_units.get(abs_kind, ("", ""))[0]
@@ -1028,7 +1293,6 @@ def load_particle_histogram2d(
     ord_axis = _edge_style_axis(ord_lo, ord_hi, n_ord)
     ord_units = {"momentum": r"m_e c", "log_gamma": ""}.get(ord_kind, "")
 
-    coords: dict[str, Any] = {"t": t, "iter": ("t", its), abs_dim: x_axis, ord_dim: ord_axis}
     attrs: dict[str, Any] = {
         "long_name": name,
         "units": val_units,
@@ -1043,7 +1307,196 @@ def load_particle_histogram2d(
         if fn is not None:
             attrs[key] = str(fn)
     attrs.update(_box_attrs(deck, units))
-    return xr.DataArray(data, coords=coords, dims=("t", abs_dim, ord_dim), name=name, attrs=attrs)
+
+    return _Histogram2DGeometry(
+        diag_dir=diag_dir,
+        name=name,
+        n_abs=int(n_abs),
+        n_ord=int(n_ord),
+        ord_first=ord_first,
+        scale=scale,
+        t_scale=t_scale,
+        abs_dim=abs_dim,
+        ord_dim=ord_dim,
+        x_axis=x_axis,
+        ord_axis=ord_axis,
+        attrs=attrs,
+    )
+
+
+def _histogram2d_records(
+    geom: _Histogram2DGeometry, *, require_monotonic: bool = False
+) -> Iterator[tuple[int, float, np.ndarray]]:
+    """Walk the files **once**, yielding ``(iteration, time, slab)`` per dump.
+
+    The slab comes out ``(abs, ord)``, scaled, in the float32 diagnostic
+    dtype — one dump resident at a time (4.1 MB for a 1000x1024 histogram,
+    ~12 MB transient while h5py's float64 read is still alive). With
+    ``require_monotonic`` an out-of-order iteration raises
+    :class:`_NonMonotonicIterations` instead of being silently mis-ordered.
+    """
+    scale = None if geom.scale is None else np.asarray(geom.scale, dtype=_DIAG_DTYPE)
+    last_it = -(1 << 62)
+    for it, grp, rec in _histogram2d_meshes(_openpmd_files(geom.diag_dir)):
+        if require_monotonic and it <= last_it:
+            raise _NonMonotonicIterations(f"{geom.diag_dir}: iteration {it} follows {last_it}")
+        last_it = it
+        t_si = float(grp.attrs.get("time", 0.0)) * float(grp.attrs.get("timeUnitSI", 1.0))
+        arr, _unit_si = _read_component(next(iter(_record_components(rec).values())))
+        slab = np.asarray(arr, dtype=_DIAG_DTYPE)
+        slab = slab.T if geom.ord_first else slab
+        if scale is not None:
+            slab = slab * scale
+        yield it, t_si * geom.t_scale, np.ascontiguousarray(slab)
+
+
+def _histogram2d_slab_da(geom: _Histogram2DGeometry, it: int, t: float, slab: np.ndarray) -> xr.DataArray:
+    """One dump as a ``(abs, ord)`` DataArray in the StreamWriter's contract."""
+    return xr.DataArray(
+        slab,
+        coords={geom.abs_dim: geom.x_axis, geom.ord_dim: geom.ord_axis},
+        dims=(geom.abs_dim, geom.ord_dim),
+        name=geom.name,
+        attrs={**geom.attrs, "time": float(t), "iter": int(it)},
+    )
+
+
+def load_particle_histogram2d(
+    diag_dir: str | Path,
+    *,
+    units: CodeUnits | None = None,
+    deck: dict | None = None,
+) -> xr.DataArray:
+    """Stack a ParticleHistogram2D history into an OSIRIS-style phase space.
+
+    Returns a ``(t, <abs>, <ord>)`` DataArray in code units (see the section
+    comment above for the normalization) — both axes classified from the
+    deck's bin functions (``z → x1`` spatial, ``uz/ux → p1/p2`` momentum,
+    …), so a ``(uz, ux)`` histogram comes out ``(t, p1, p2)``. The deck (the run's rendered
+    ``inputs``) supplies the abscissa/ordinate/value functions, the species
+    and the bin ranges; without it the ranges fall back to the openPMD grid
+    attrs and the deposit is treated as a count. Without ``units`` the raw
+    per-bin SI sums are returned unscaled.
+
+    This materializes the **whole** ``(t, abs, ord)`` cube (47.9 GB for a
+    production ``x1log_gamma_q1``) and walks the files twice — once to size
+    it, once to fill it. Converters should use
+    :func:`convert_histogram2d_streaming`, which writes the same NetCDF in a
+    single pass with one slab resident; this eager form is for interactive
+    use and for the histories small enough to hold.
+    """
+    geom = _histogram2d_geometry(diag_dir, units=units, deck=deck)
+    # Sizing pass: iteration numbers only, no pixel data (so its cost is set
+    # by the dump count, not the slab size).
+    index: list[tuple[int, float]] = []
+    for it, grp, _rec in _histogram2d_meshes(_openpmd_files(geom.diag_dir)):
+        index.append((int(it), float(grp.attrs.get("time", 0.0)) * float(grp.attrs.get("timeUnitSI", 1.0))))
+    if not index:
+        raise FileNotFoundError(f"No histogram meshes found in {geom.diag_dir}")
+
+    order = np.argsort([it for it, _ in index], kind="stable")
+    rows = np.empty(len(index), dtype=np.int64)
+    rows[order] = np.arange(len(index))
+    t = np.asarray([ts for _, ts in index], dtype="float64")[order] * geom.t_scale
+    its = np.asarray([it for it, _ in index], dtype="int64")[order]
+
+    data = np.empty((len(index), geom.n_abs, geom.n_ord), dtype=_DIAG_DTYPE)
+    for j, (_it, _t, slab) in enumerate(_histogram2d_records(geom)):
+        data[rows[j]] = slab
+
+    coords: dict[str, Any] = {
+        "t": t,
+        "iter": ("t", its),
+        geom.abs_dim: geom.x_axis,
+        geom.ord_dim: geom.ord_axis,
+    }
+    return xr.DataArray(
+        data, coords=coords, dims=("t", geom.abs_dim, geom.ord_dim), name=geom.name, attrs=dict(geom.attrs)
+    )
+
+
+def convert_histogram2d_streaming(
+    diag_dir: str | Path,
+    dest: str | Path,
+    *,
+    units: CodeUnits | None = None,
+    deck: dict | None = None,
+    complevel: int = 4,
+) -> Path:
+    """Convert a ParticleHistogram2D history to NetCDF in a single pass.
+
+    The WarpX twin of :func:`adept.osiris.stream.convert_diagnostic_streaming`
+    (and it reuses that module's ``StreamWriter``), so the two engines'
+    phase-space conversions have the same memory profile: peak resident is
+    one slab plus one write batch, not the whole stacked cube. For the
+    production ``x1log_gamma_q1`` (11705 dumps x 1000 x 1024) that is ~30 MB
+    against a 47.9 GB cube — and, because
+    :func:`load_particle_histogram2d`'s result then went through
+    ``series_to_dataset``'s deep copy, ~96 GB of true peak. That was the
+    srs-1d-ppc-scan postproc OOM (all 6 postprocs SIGKILLed in a 55 GB
+    cgroup, job 57536430).
+
+    Each file is opened **once**: the axes, attrs and scaling all come from
+    the first dump (:func:`_histogram2d_geometry`), and the ``t`` dimension
+    is unlimited, so nothing needs the history length up front. At the
+    2-omega_0-Nyquist field cadences (a dump every 7-9 steps) the per-file
+    open cost — ~6.5 ms measured on Perlmutter's Lustre — is what sets the
+    conversion wall time, so halving the walks halves the stage.
+
+    ``StreamWriter`` also chunks the variable ``(chunk_t, n_abs, n_ord)``
+    with ``chunk_t`` sized to ~1 MiB — 1 dump per chunk at production bin
+    counts — so a per-dump read on the result is chunk-aligned. The batch
+    path's default h5netcdf chunking (``(183, 16, 32)`` on the production
+    cube) spread one time slice over 2016 chunks, the 183x read
+    amplification behind the 6.66 h ``collect_srs`` stage.
+
+    Restarts on the eager path if the walk hits an out-of-order iteration
+    (see :class:`_NonMonotonicIterations`). Rebuilds ``dest`` from scratch.
+    Returns ``dest``.
+    """
+    from adept.osiris.stream import StreamWriter
+
+    dest = Path(dest)
+    geom = _histogram2d_geometry(diag_dir, units=units, deck=deck)
+
+    def _eager() -> Path:
+        from adept.osiris.io import series_to_dataset
+
+        ds = series_to_dataset(load_particle_histogram2d(diag_dir, units=units, deck=deck))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        ds.to_netcdf(
+            dest,
+            engine="h5netcdf",
+            encoding={n: {"zlib": True, "complevel": complevel, "shuffle": True} for n in ds.data_vars},
+        )
+        return dest
+
+    if dest.exists():
+        # Never resume into a partial file: StreamWriter's append-mode resume
+        # is for the drainer, which re-reads the same dumps. Here a leftover
+        # from a killed postproc would silently truncate the history.
+        dest.unlink()
+
+    writer = None
+    try:
+        for it, t, slab in _histogram2d_records(geom, require_monotonic=True):
+            da = _histogram2d_slab_da(geom, it, t, slab)
+            if writer is None:
+                # The first dump doubles as the schema template.
+                writer = StreamWriter(dest, da, source_dir=geom.diag_dir, complevel=complevel)
+            writer.append(da)
+    except _NonMonotonicIterations:
+        if writer is not None:
+            writer.close()
+            writer = None
+        dest.unlink(missing_ok=True)
+        return _eager()
+    finally:
+        if writer is not None:
+            writer.close()
+    if not dest.exists():  # pragma: no cover - _histogram2d_geometry already raised
+        raise FileNotFoundError(f"No histogram meshes found in {geom.diag_dir}")
+    return dest
 
 
 _BIN_HEADER_RE = re.compile(r"^bin(\d+)=(.+)$")
@@ -1529,24 +1982,32 @@ def save_run_datasets(
         written.append(dest)
 
     for diag_dir in _full_diag_dirs(run_dir):
-        for mesh, comp in list_field_records(diag_dir):
-            try:
-                da = load_field_series(diag_dir, mesh, comp, units=units)
-            except Exception as e:  # one bad record must not abort the rest
-                print(f"[post] skipping {mesh}/{comp} from {diag_dir.name}: {e}")
-                continue
-            cartesian = all(str(d).startswith("x") for d in da.dims if str(d) != "t")
-            key_info = _mesh_diag_key(mesh, comp, cartesian)
-            rel = key_info[0] if key_info is not None else f"FLD/{da.name}"
+        # All of a diagnostic's records are written from ONE walk of its
+        # dumps (convert_field_series_streaming). The keys are known from the
+        # first file, so `want` filters before anything is read — the
+        # per-record loop this replaces loaded each series and then discarded
+        # it if the whitelist said no.
+        try:
+            meshes_path, plans = _field_plan(diag_dir, units=units)
+        except Exception as e:
+            print(f"[post] skipping fields from {diag_dir.name}: {e}")
+            meshes_path, plans = "fields", []
+        targets: list[tuple[str, _FieldRecordPlan]] = []
+        for plan in plans:
+            rel = plan.rel
             if rel in taken:
                 rel = f"{rel}-{diag_dir.name}"
             if not want(rel):
                 continue
+            targets.append((rel, plan))
+        if targets:
             try:
-                write(series_to_dataset(da), rel)
-                taken.add(rel)
+                got = convert_field_series_streaming(diag_dir, targets, out_dir, units=units, meshes_path=meshes_path)
+                written += got
+                done = {p for p in got}
+                taken.update(rel for rel, _p in targets if (out_dir / f"{rel}.nc") in done)
             except Exception as e:
-                print(f"[post] skipping {rel} from {diag_dir.name}: {e}")
+                print(f"[post] skipping fields from {diag_dir.name}: {e}")
         for species in list_species(diag_dir):
             rel = f"RAW/{species}"
             if rel in taken:
@@ -1561,13 +2022,18 @@ def save_run_datasets(
                 print(f"[post] skipping {rel} from {diag_dir.name}: {e}")
 
     # ParticleHistogram2D phase spaces (openPMD dirs under reducedfiles/).
+    # Streamed a dump at a time (see convert_histogram2d_streaming): these
+    # are the only diagnostics whose stacked cube is too big to hold, and
+    # the streaming writer also gives them t-aligned chunking.
     for name, diag_dir in list_histogram2d_diags(run_dir).items():
         rel = f"PHA/{name}/{_deck_species_of(deck, name)}"
         if not want(rel):
             continue
+        dest = out_dir / f"{rel}.nc"
         try:
-            da = load_particle_histogram2d(diag_dir, units=units, deck=deck)
-            write(series_to_dataset(da), rel)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            convert_histogram2d_streaming(diag_dir, dest, units=units, deck=deck)
+            written.append(dest)
             taken.add(rel)
         except Exception as e:
             print(f"[post] skipping {rel}: {e}")

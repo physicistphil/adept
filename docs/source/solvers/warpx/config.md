@@ -185,6 +185,36 @@ reduced diagnostic after the OSIRIS phase space it mirrors (`p1x1`,
   over the bin range) and the deck's `geometry.prob_lo/hi` become
   `sim.XMIN/XMAX`.
 
+### Conversion: one walk, one slab
+
+Both the field records and the ParticleHistogram2D phase spaces are converted
+**a dump at a time**, through the same `StreamWriter` the OSIRIS drainer uses.
+Two properties follow, and both are load-bearing at production cadences:
+
+*Peak memory is one slab plus a ~1 MiB write batch, not the stacked history.*
+A production `x1log_gamma_q1` (11705 dumps × 1000 × 1024) is a 47.9 GB cube,
+and the eager `load_particle_histogram2d` → `series_to_dataset` path held two
+copies of it. The field path stacked a list of float64 slabs — ~6.3 GB per
+component at 88k dumps of 3594 cells, and far worse in 2D.
+
+*Each dump is opened once, not once per record.* openPMD bundles every record
+of a dump into one file, but the converter used to re-walk the whole tree per
+component. At a field cadence giving a 2 ω₀ Nyquist (a dump every 7–9 steps at
+`dt = 0.178/ω₀`, so ~88k dumps over a 23 ps run) that is 614k opens against
+88k files; at the ~6.5 ms/file measured on Perlmutter's Lustre the redundant
+six-sevenths alone cost ~57 min per simulation. Everything a record needs —
+axes, code-unit scaling, `binary/` key, storage-order transpose — comes from
+the first dump, so `diagnostics_to_log` now also skips records *before* they
+are read rather than loading and discarding them.
+
+`StreamWriter` chunks each variable `(chunk_t, …)` with `chunk_t` sized to
+~1 MiB (1 dump per chunk at production bin counts), so the per-dump reads in
+`osiris_lpi` are chunk-aligned; the batch path's default h5netcdf chunking
+spread one time slice over 2016 chunks. `load_field_series` and
+`load_particle_histogram2d` still return whole histories for interactive use
+and remain the reference implementations the streamed output is tested
+against.
+
 Because the contract matches, `adept.osiris.io.list_diagnostics` / `load_series` and the
 OSIRIS canned plots read these files unchanged. Logged metrics include `final_step`,
 `completed_steps_frac` (the exit-0 early-termination tripwire — WarpX exits 0 on
