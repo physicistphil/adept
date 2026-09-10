@@ -199,6 +199,10 @@ class LightModel(BaseModel):
     # optional isotropic low-pass filter on E0/E1 once per EPW step, as a fraction of
     # the grid Nyquist wavenumber (None = off)
     filter: float | None = None
+    # diagnostic: keep only kx >= 0 in the PUMP spectrum once per EPW step. The pump
+    # operator is even in kx, so -k0 is a degenerate freely-propagating mode that the
+    # real-space SRS source drives resonantly; this removes it. E1 is untouched.
+    one_way: bool = False
 
 
 class HPEModel(BaseModel):

@@ -124,6 +124,23 @@ class CoupledLight(RamanLight):
             k_mag = np.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2)
             self.light_filter = jnp.asarray(np.where(k_mag <= frac * k_nyq, 1.0, 0.0))[..., None]
 
+        # optional DIRECTIONAL (one-way) mask on the pump only: keep kx >= 0.
+        # The pump's x-operator here is i c^2/(2 w0) d2x, whose numerical dispersion
+        # w(k) = c^2 k^2 / (2 w0) is EVEN in kx, so -k0 is a degenerate, freely
+        # propagating mode of the discretisation and the real-space SRS source
+        # lap(phi)*E1 drives it as resonantly as +k0. Measured in srs-2d-testbed run 6:
+        # the source carries 4-5x more power near -k0 than near +k0 where the backward
+        # pump grows, and E0 reaches ~48% backward power by 10 ps, which is what drives
+        # the incident-flux probe through zero. This option removes the backward half of
+        # the pump spectrum so that contribution can be tested directly. Diagnostic,
+        # default off; E1 is untouched (SRS backscatter is legitimately kx < 0).
+        one_way = cfg["terms"].get("light", {}).get("one_way", False)
+        if one_way:
+            kx_ow = np.asarray(cfg["grid"]["kx"])
+            self.one_way_mask = jnp.asarray(np.where(kx_ow >= 0.0, 1.0, 0.0))[:, None, None]
+        else:
+            self.one_way_mask = None
+
         # ---- pump injector (MATLAB lines 1707-1753, mirrored to the left edge) ----
         pump = cfg["drivers"]["E0"]["derived"]
         x_inject = cfg["grid"]["xmin"] + pump["offset"]
@@ -295,6 +312,8 @@ class CoupledLight(RamanLight):
             return (E0, E1)
 
         E0, E1 = lax.fori_loop(0, self.n_sub, substep, (E0, E1))
+        if self.one_way_mask is not None:
+            E0 = jnp.fft.ifft2(jnp.fft.fft2(E0, axes=(0, 1)) * self.one_way_mask, axes=(0, 1))
         if self.light_filter is not None:
             E0 = jnp.fft.ifft2(jnp.fft.fft2(E0, axes=(0, 1)) * self.light_filter, axes=(0, 1))
             E1 = jnp.fft.ifft2(jnp.fft.fft2(E1, axes=(0, 1)) * self.light_filter, axes=(0, 1))

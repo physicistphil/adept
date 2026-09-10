@@ -349,6 +349,11 @@ def get_derived_quantities(cfg: dict) -> dict:
         )
 
     pump_depletion = cfg["terms"].get("light", {}).get("pump_depletion", False)
+    if cfg["terms"].get("light", {}).get("one_way", False) and not pump_depletion:
+        raise ValueError(
+            "terms.light.one_way masks the evolved pump's backward spectrum and requires "
+            "terms.light.pump_depletion: true (a prescribed pump has no spectrum to mask)"
+        )
     if pump_depletion:
         if not cfg["terms"]["epw"]["source"].get("srs", False):
             raise ValueError("terms.light.pump_depletion requires terms.epw.source.srs: true")
