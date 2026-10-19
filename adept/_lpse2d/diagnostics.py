@@ -341,12 +341,13 @@ def series_metrics(series, cfg: dict) -> dict[str, float]:
         hpe = cfg["terms"]["hpe"]
         # one-particle resolution of the hot fraction; "first hot electrons" means a
         # sustained signal of at least a few particles above threshold
-        try:
-            from scipy import special
+        from adept._lpse2d.core.hpe import tail_fraction
 
-            f_tail = float(special.erfc(float(hpe["v_min"]) / np.sqrt(2.0)))
-        except Exception:
-            f_tail = 1.0
+        if hpe.get("tail_distribution", "gaussian_v") == "gaussian_v":
+            f_tail = tail_fraction(hpe, 1.0, 1.0)  # closed form erfc(v_min / sqrt 2), independent of vte and c
+        else:
+            derived = cfg["units"]["derived"]
+            f_tail = tail_fraction(hpe, float(np.sqrt(derived["vte_sq"])), float(derived["c"]))
         min_frac = 3.0 * f_tail / float(hpe["n_particles"])
 
         for key in ("fhot_50keV", "fhot_100keV"):

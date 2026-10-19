@@ -533,6 +533,10 @@ class HPEModel(BaseModel):
     active: bool = False
     n_particles: int = 500000
     v_min: float = 2.5  # tail cutoff, units of vte
+    # thermal law of the loaded / re-injected tail (1-D tracker): "gaussian_v" = Maxwellian in the velocity v,
+    # "gaussian_u" = Gaussian in the proper velocity u = gamma v with width vte (OSIRIS `uth`), "juttner" = the
+    # longitudinal marginal of the 3-D Maxwell-Juttner law. 2-D (ny > 1) supports gaussian_v only
+    tail_distribution: str = "gaussian_v"
     v_max: float = 1.0  # histogram half-span, units of c
     v_blend_buffer: float = 0.5  # analytic/HPE blend buffer above v_min, units of vte
     nv: int = 512  # velocity bins spanning (-v_max, v_max)

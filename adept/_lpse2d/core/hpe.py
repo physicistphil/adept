@@ -111,6 +111,102 @@ def _analytic_rate(cfg: dict) -> np.ndarray:
     return np.asarray(analytic_landau_rate(cfg), dtype=np.float64)
 
 
+# ---------------------------------------------------------------- thermal law of the tail --
+# The 1-D tracker loads (and re-injects at thermalizing walls) the tail |v| > v_min of a thermal law in the
+# longitudinal velocity. ``gaussian_v`` is a Maxwellian in the velocity v (the closed-form path); the others are
+# tabulated on a uniform grid of the proper velocity u = gamma v and sampled by inverse CDF.
+TAIL_DISTRIBUTIONS = ("gaussian_v", "gaussian_u", "juttner")
+_TABLE_POINTS = 20001
+
+
+def tail_density_u(kind: str, u, vte: float, c: float):
+    """Unnormalised 1-D density in the proper velocity u (code velocity units) of the thermal law ``kind``:
+    ``gaussian_v`` exp(-v^2 / 2 vte^2) dv/du, ``gaussian_u`` exp(-u^2 / 2 vte^2) (OSIRIS ``uth`` = vte),
+    ``juttner`` the longitudinal marginal of the 3-D Maxwell-Juttner law, (gamma + theta) exp(-(gamma - 1) / theta)
+    with theta = vte^2 / c^2."""
+    u = np.asarray(u, dtype=np.float64)
+    gamma = np.sqrt(1.0 + (u / c) ** 2)
+    if kind == "gaussian_v":
+        return np.exp(-0.5 * (u / gamma / vte) ** 2) / gamma**3
+    if kind == "gaussian_u":
+        return np.exp(-0.5 * (u / vte) ** 2)
+    if kind == "juttner":
+        theta = (vte / c) ** 2
+        return (gamma + theta) * np.exp(-(gamma - 1.0) / theta)
+    raise ValueError(f"terms.hpe.tail_distribution must be one of {TAIL_DISTRIBUTIONS}, got {kind!r}")
+
+
+def _tail_kind(hpe: dict, is_2d: bool) -> str:
+    kind = hpe.get("tail_distribution", "gaussian_v")
+    if kind not in TAIL_DISTRIBUTIONS:
+        raise ValueError(f"terms.hpe.tail_distribution must be one of {TAIL_DISTRIBUTIONS}, got {kind!r}")
+    if is_2d and kind != "gaussian_v":
+        raise ValueError("terms.hpe.tail_distribution other than gaussian_v is implemented for the 1-D tracker (ny == 1) only")
+    return kind
+
+
+def _u_of_v(v, c: float):
+    return np.asarray(v) / np.sqrt(1.0 - (np.asarray(v) / c) ** 2)
+
+
+def _u_extent(u_floor: float, vte: float, c: float) -> float:
+    """Upper end of the tabulated u range: every law is below exp(-60) of its peak at (1 + 60 theta) in gamma."""
+    theta = (vte / c) ** 2
+    return max(c * np.sqrt((1.0 + 60.0 * theta) ** 2 - 1.0), 2.0 * u_floor)
+
+
+def _cumulative(u, density):
+    cdf = np.concatenate([[0.0], np.cumsum(0.5 * (density[1:] + density[:-1]) * np.diff(u))])
+    return cdf / cdf[-1]
+
+
+def _strictly_increasing(u, cdf):
+    keep = np.concatenate([[True], np.diff(cdf) > 0.0])
+    return u[keep], cdf[keep]
+
+
+def tail_table(hpe: dict, vte: float, c: float, flux_weighted: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """``(u, cdf)`` of the loaded speed law: the tail ``v_min vte < |v| <= 0.99 c`` of ``tail_distribution`` on a
+    uniform u grid, for inverse-CDF sampling. ``flux_weighted`` multiplies the density by v: the law of the
+    particles crossing a plane (wall re-injection)."""
+    v_min = float(hpe["v_min"]) * vte
+    u_lo, u_cap = float(_u_of_v(v_min, c)), float(_u_of_v(0.99 * c, c))
+    u = np.linspace(u_lo, min(_u_extent(u_lo, vte, c), u_cap), _TABLE_POINTS)
+    density = tail_density_u(hpe.get("tail_distribution", "gaussian_v"), u, vte, c)
+    if flux_weighted:
+        density = density * u / np.sqrt(1.0 + (u / c) ** 2)
+    return _strictly_increasing(u, _cumulative(u, density))
+
+
+def _full_law_cdf(kind: str, vte: float, c: float, u_floor: float) -> tuple[np.ndarray, np.ndarray]:
+    """``(u, cdf)`` of the whole law on u >= 0 (both signs by symmetry)."""
+    u = np.linspace(0.0, _u_extent(u_floor, vte, c), 4 * _TABLE_POINTS)
+    return u, _cumulative(u, tail_density_u(kind, u, vte, c))
+
+
+def tail_fraction(hpe: dict, vte: float, c: float) -> float:
+    """Fraction of all electrons in the 1-D tail ``|v| > v_min vte`` of ``tail_distribution``."""
+    kind = hpe.get("tail_distribution", "gaussian_v")
+    if kind == "gaussian_v":
+        return float(special.erfc(float(hpe["v_min"]) / np.sqrt(2.0)))
+    u_lo = float(_u_of_v(float(hpe["v_min"]) * vte, c))
+    u, cdf = _full_law_cdf(kind, vte, c, u_lo)
+    return float(1.0 - np.interp(u_lo, u, cdf))
+
+
+def _tail_bin_probabilities(kind: str, edges, v_min: float, vte: float, c: float) -> np.ndarray:
+    """Probability of each v bin under the law ``kind`` restricted to ``|v| > v_min`` (unnormalised)."""
+    u, cdf = _full_law_cdf(kind, vte, c, float(_u_of_v(v_min, c)))
+
+    def cdf_v(v):  # P(0 <= v' <= v) for v >= 0, from the half-law table
+        return np.interp(_u_of_v(np.clip(v, 0.0, (1.0 - 1e-15) * c), c), u, cdf)
+
+    lo, hi = edges[:-1], edges[1:]
+    positive = np.clip(cdf_v(np.maximum(hi, v_min)) - cdf_v(np.maximum(lo, v_min)), 0.0, None)
+    negative = np.clip(cdf_v(np.maximum(-lo, v_min)) - cdf_v(np.maximum(-hi, v_min)), 0.0, None)
+    return positive * (hi > v_min) + negative * (lo < -v_min)
+
+
 def resonance_arrays(cfg: dict) -> dict:
     """Build the velocity grid, resonance map, blend mask, and calibration input.
 
@@ -154,6 +250,7 @@ def resonance_arrays(cfg: dict) -> dict:
 
     v_min = float(hpe["v_min"]) * vte
     buffer = float(hpe["v_blend_buffer"]) * vte
+    tail_kind = _tail_kind(hpe, is_2d)
     if is_2d:
         mask_res = (k_mag > 0.0) & (v_phi > v_min + buffer) & (v_phi < 0.9 * v_max)
         # Fraction of an isotropic 2-D Maxwellian outside the loaded speed circle.
@@ -174,7 +271,7 @@ def resonance_arrays(cfg: dict) -> dict:
             np.exp(-0.5 * (v_centers / vte) ** 2) / (np.sqrt(2.0 * np.pi) * vte) * perpendicular_tail / f_tail_frac
         )
         f0_expected /= np.sum(f0_expected) * dv
-    else:
+    elif tail_kind == "gaussian_v":
         mask_res = (np.abs(kx) > 0.0) & (np.abs(v_phi) > v_min + buffer) & (np.abs(v_phi) < 0.9 * v_max)
         f_tail_frac = float(special.erfc(v_min / (np.sqrt(2.0) * vte)))
 
@@ -185,6 +282,11 @@ def resonance_arrays(cfg: dict) -> dict:
         p_bin = np.clip(cdf(hi) - cdf(np.maximum(lo, v_min)), 0.0, None) * (hi > v_min) + np.clip(
             cdf(np.minimum(hi, -v_min)) - cdf(lo), 0.0, None
         ) * (lo < -v_min)
+        f0_expected = p_bin / (np.sum(p_bin) * dv)
+    else:
+        mask_res = (np.abs(kx) > 0.0) & (np.abs(v_phi) > v_min + buffer) & (np.abs(v_phi) < 0.9 * v_max)
+        f_tail_frac = tail_fraction(hpe, vte, c)
+        p_bin = _tail_bin_probabilities(tail_kind, edges, v_min, vte, c)
         f0_expected = p_bin / (np.sum(p_bin) * dv)
 
     return {
@@ -225,11 +327,17 @@ def load_particles(cfg: dict) -> dict:
         velocity = speed[:, None] * np.stack((np.cos(velocity_angle), np.sin(velocity_angle)), axis=-1)
         gamma_rel = 1.0 / np.sqrt(1.0 - (speed / c) ** 2)
         u = gamma_rel[:, None] * velocity
-    else:
+    elif _tail_kind(hpe, is_2d) == "gaussian_v":
         a, b = float(hpe["v_min"]), 0.99 * c / vte
         speed = stats.truncnorm.rvs(a, b, loc=0.0, scale=1.0, size=n_p, random_state=rng) * vte
         velocity = rng.choice(np.asarray([-1.0, 1.0]), size=n_p) * speed
         u = velocity / np.sqrt(1.0 - (velocity / c) ** 2)
+    else:
+        # inverse CDF of the tabulated tail law in u (|v| in (v_min vte, 0.99 c])
+        u_table, cdf_table = tail_table(hpe, vte, c)
+        speed_u = np.interp(rng.uniform(size=n_p), cdf_table, u_table)
+        u = rng.choice(np.asarray([-1.0, 1.0]), size=n_p) * speed_u
+        velocity = u / np.sqrt(1.0 + (u / c) ** 2)
 
     # Draw cells from the complete 2-D density map. This remains one ensemble:
     # no particle list or velocity distribution is attached to an individual cell.
@@ -366,6 +474,14 @@ class HybridParticleEvolution:
         self.mask_res = jnp.asarray(arrays["mask_res"])
         self.gamma_analytic = jnp.asarray(arrays["gamma_analytic"])
         self.f_tail_frac = arrays["f_tail_frac"]
+        # thermal law of the tail (1-D tracker): None = the closed-form Maxwellian in v; otherwise the
+        # flux-weighted (u, cdf) table that thermalizing walls re-inject from
+        self.tail_distribution = _tail_kind(hpe, self.is_2d)
+        self.wall_table = (
+            None
+            if self.tail_distribution == "gaussian_v"
+            else tuple(jnp.asarray(a) for a in tail_table(hpe, self.vte, self.c, flux_weighted=True))
+        )
         # ---- LPSE HPE controls (hpe.gammaLimit.*, allowGrowth, thermalizationProbability,
         # magneticField, enforceEnergyConservation, numStepsToAverageEnergyChange, metrics)
         self.gamma_limit_damping = float(hpe.get("gamma_limit_damping", 1500.0))  # 1/ps
@@ -589,8 +705,12 @@ class HybridParticleEvolution:
         any_out = out_left | out_right
         key, therm_key = jax.random.split(jax.random.fold_in(self.wall_key, jnp.asarray(t / self.dt).astype(jnp.int32)))
         uni = jax.random.uniform(key, (self.n_p,), minval=1.0e-12, maxval=1.0)
-        speed = jnp.minimum(jnp.sqrt(self.v_min**2 - 2.0 * self.vte**2 * jnp.log(uni)), 0.99 * self.c)
-        u_new = speed / jnp.sqrt(1.0 - (speed / self.c) ** 2)
+        if self.wall_table is None:
+            # flux-weighted Maxwellian-in-v tail: survival exp(-(v^2 - v_min^2) / 2 vte^2)
+            speed = jnp.minimum(jnp.sqrt(self.v_min**2 - 2.0 * self.vte**2 * jnp.log(uni)), 0.99 * self.c)
+            u_new = speed / jnp.sqrt(1.0 - (speed / self.c) ** 2)
+        else:
+            u_new = jnp.interp(uni, self.wall_table[1], self.wall_table[0])
         flux, cone = self._wall_instruments(
             (out_left, out_right, jnp.zeros_like(out_left), jnp.zeros_like(out_left)),
             jnp.stack((u, jnp.zeros_like(u)), axis=-1),

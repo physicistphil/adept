@@ -514,6 +514,12 @@ def get_derived_quantities(cfg: dict) -> dict:
                 raise ValueError("terms.hpe.n_windows > 1 is not implemented with terms.hpe.energy_conservation")
         if hpe["v_min"] < 0.0:
             raise ValueError("terms.hpe.v_min must be non-negative")
+        from adept._lpse2d.core.hpe import TAIL_DISTRIBUTIONS
+
+        if hpe["tail_distribution"] not in TAIL_DISTRIBUTIONS:
+            raise ValueError(f"terms.hpe.tail_distribution must be one of {TAIL_DISTRIBUTIONS}")
+        if hpe["tail_distribution"] != "gaussian_v" and int(cfg_grid["ny"]) > 1:
+            raise ValueError("terms.hpe.tail_distribution other than gaussian_v is implemented for the 1-D tracker (ny == 1) only")
         vte = np.sqrt(cfg["units"]["derived"]["vte_sq"])
         if hpe["v_min"] * vte >= 0.99 * cfg["units"]["derived"]["c"]:
             raise ValueError("terms.hpe.v_min * vte must be below the 0.99c particle-speed cap")
@@ -532,7 +538,7 @@ def get_derived_quantities(cfg: dict) -> dict:
         print(
             f"HPE is on -- {hpe['n_particles']} {'box-averaged ' if int(hpe['n_windows']) == 1 else ''}tail particles "
             f"({dimensionality}, "
-            f"|v| > {hpe['v_min']} vte), "
+            f"|v| > {hpe['v_min']} vte, {hpe['tail_distribution']} law), "
             f"{hpe['substeps']} particle substeps per EPW step"
         )
 
