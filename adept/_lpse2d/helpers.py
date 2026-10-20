@@ -1089,8 +1089,9 @@ def make_field_xarrays(cfg, this_t, state, td):
         coords=(tax_tuple, (r"kx ($kc\omega_0^{-1}$)", shift_kx), (r"ky ($kc\omega_0^{-1}$)", shift_ky)),
     )
     phi_x = xr.DataArray(phi_vs_t, coords=(tax_tuple, xax_tuple, yax_tuple))
-    ex = xr.DataArray(np.fft.ifft2(ex_k_np, axes=(1, 2)) / nx / ny * 4, coords=(tax_tuple, xax_tuple, yax_tuple))
-    ey = xr.DataArray(np.fft.ifft2(ey_k_np, axes=(1, 2)) / nx / ny * 4, coords=(tax_tuple, xax_tuple, yax_tuple))
+    # E = -grad(phi) = ifft2(-i k phi_k), the solver's own field (SpectralEPWSolver.phi_k_to_e_fields)
+    ex = xr.DataArray(np.fft.ifft2(ex_k_np, axes=(1, 2)), coords=(tax_tuple, xax_tuple, yax_tuple))
+    ey = xr.DataArray(np.fft.ifft2(ey_k_np, axes=(1, 2)), coords=(tax_tuple, xax_tuple, yax_tuple))
     e0x = xr.DataArray(np.array(state["E0"]).view(_complex)[..., 0], coords=(tax_tuple, xax_tuple, yax_tuple))
     e0y = xr.DataArray(np.array(state["E0"]).view(_complex)[..., 1], coords=(tax_tuple, xax_tuple, yax_tuple))
     e1x = xr.DataArray(np.array(state["E1"]).view(_complex)[..., 0], coords=(tax_tuple, xax_tuple, yax_tuple))
