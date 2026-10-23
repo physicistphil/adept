@@ -10,6 +10,7 @@ from adept._base_ import Stepper
 from adept._lpse2d.core.vector_field import SplitStep
 from adept._lpse2d.helpers import (
     _Q,
+    continue_step_sequence,
     get_density_profile,
     get_derived_quantities,
     get_save_quantities,
@@ -183,8 +184,15 @@ class BaseLPSE2D(ADEPTModule):
             self.state = restored
             for sub in self.cfg["save"].values():
                 if isinstance(sub, dict) and isinstance(sub.get("t"), dict) and "tmin" in sub["t"]:
-                    if _Q(sub["t"]["tmin"]).to("ps").value < self.restart_t0:
-                        sub["t"]["tmin"] = f"{self.restart_t0:.9g}ps"
+                    t_cfg = sub["t"]
+                    tmin = _Q(t_cfg["tmin"]).to("ps").value
+                    if tmin < self.restart_t0:
+                        # continue the unbroken run's save steps (every max(round(dt_save / dt), 1) from tmin)
+                        if "dt" in t_cfg:
+                            tmin = continue_step_sequence(tmin, _Q(t_cfg["dt"]).to("ps").value, dt, self.restart_t0)
+                        else:
+                            tmin = self.restart_t0
+                        t_cfg["tmin"] = f"{tmin:.12g}ps"
             self._rebase_light_spectrum_probes()
             # the default series samples the grid's time axis: keep only the resumed interval
             t_axis = np.asarray(self.cfg["grid"]["t"])
@@ -195,7 +203,7 @@ class BaseLPSE2D(ADEPTModule):
 
     def _rebase_light_spectrum_probes(self):
         """On restart, start each ``save.light_spectrum`` probe (a list of probes with a top-level,
-        optional ``tmin``) at its first own sample ``tmin + k interval`` inside the resumed interval,
+        optional ``tmin``) at its first own sample inside the resumed interval (``continue_step_sequence``),
         so it continues the unbroken run's sample times; a probe whose window has ended is dropped."""
 
         def ps(value):
@@ -207,7 +215,7 @@ class BaseLPSE2D(ADEPTModule):
             interval = ps(probe["interval"])
             t_first = ps(probe["tmin"]) if probe.get("tmin") is not None else ps(self.cfg["grid"]["tmin"])
             if t_first < self.restart_t0:
-                t_first += math.ceil((self.restart_t0 - t_first) / interval - 1.0e-9) * interval
+                t_first = continue_step_sequence(t_first, interval, float(self.cfg["grid"]["dt"]), self.restart_t0)
             t_last = ps(probe["tmax"]) if probe.get("tmax") is not None else ps(self.cfg["grid"]["tmax"])
             if t_first > t_last + 1.0e-12:
                 field = probe.get("field", "E0")

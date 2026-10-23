@@ -2150,6 +2150,21 @@ def _interpolated_field_save(cfg: dict):
     return save_func
 
 
+def _save_stride(period: float, dt: float) -> int:
+    return max(math.floor(period / dt + 0.5), 1)  # LPSE's roundf (half away from zero), not round's half-even
+
+
+def continue_step_sequence(tmin: float, period: float, dt: float, t_restart: float) -> float:
+    """The first time at or after ``t_restart`` of the save sequence ``step_save_times(tmin, ., period,
+    dt)`` starts (all in ps), so that a resumed run continues the unbroken run's save times."""
+    stride = _save_stride(period, dt)
+    first = math.ceil(tmin / dt - 1.0e-9)
+    restart_step = math.ceil(t_restart / dt - 1.0e-9)
+    if first < restart_step:
+        first += stride * math.ceil((restart_step - first) / stride)
+    return first * dt
+
+
 def step_save_times(tmin: float, tmax: float, period: float, dt: float) -> tuple[np.ndarray, int]:
     """Save times on the solver's step grid t = n dt: the first step at or after ``tmin``, then every
     ``max(round(period / dt), 1)`` steps up to ``tmax`` (all in ps). LPSE likewise collects its
@@ -2160,7 +2175,7 @@ def step_save_times(tmin: float, tmax: float, period: float, dt: float) -> tuple
 
     :return: the save times and the stride in steps
     """
-    stride = max(math.floor(period / dt + 0.5), 1)  # LPSE's roundf (half away from zero), not round's half-even
+    stride = _save_stride(period, dt)
     first = math.ceil(tmin / dt - 1.0e-9)
     last = math.floor(tmax / dt + 1.0e-9)
     if last < first:
@@ -2243,8 +2258,9 @@ def light_spectrum_save(cfg: dict, probe: dict) -> dict:
     """The save group of one light spectrum probe (LPSE ``LightSpectrum``): the field ``E0`` or
     ``E1`` on the sub-box ``x: [xmin, xmax]``, ``y: [ymin, ymax]`` (coordinates from the box
     centre, as LPSE's ``location.min / .max``; nearest grid nodes, a whole axis when omitted),
-    sampled every ``interval`` from ``tmin`` (default the grid start) to ``tmax`` (default the
-    grid end); with ``terms.epw.solver: combined`` the ``E1`` probe records the transverse part
+    sampled every ``interval`` (rounded to whole solver steps, as LPSE's ``numStepsPerStep``,
+    ``step_save_times``) from the first step at or after ``tmin`` (default the grid start) to ``tmax``
+    (default the grid end); with ``terms.epw.solver: combined`` the ``E1`` probe records the transverse part
     (the Raman light) of the combined field. ``poynting: true`` keeps one guard cell on each side
     so the Poynting components can be differenced in post-processing. The time series and its omega spectrum are
     written by ``make_light_spectrum_xarrays``."""
@@ -2269,8 +2285,13 @@ def light_spectrum_save(cfg: dict, probe: dict) -> dict:
     tmax = min(tmax, grid_tmax)
     if tmax < tmin:
         raise ValueError("save.light_spectrum has tmax < tmin")
-    n_t = int(np.floor((tmax - tmin) / interval + 1.0e-9)) + 1
-    t_ax = tmin + interval * np.arange(n_t)
+    grid_dt = float(cfg["grid"]["dt"])
+    t_ax, stride = step_save_times(tmin, tmax, interval, grid_dt)
+    if abs(stride * grid_dt - interval) > 1.0e-9 * interval:
+        print(
+            f"save.light_spectrum interval = {interval:.6g} ps is not a whole number of solver steps (grid.dt = "
+            f"{grid_dt:.6g} ps): the {field} probe samples every {stride} steps ({stride * grid_dt:.6g} ps)"
+        )
     guard = 1 if bool(probe.get("poynting", False)) else 0
 
     def index_range(axis, key, n):
@@ -2300,7 +2321,7 @@ def light_spectrum_save(cfg: dict, probe: dict) -> dict:
         return {"E": light_part(y)[field][x_slice, y_slice, :]}
 
     return {
-        "t": {"ax": jnp.asarray(t_ax), "dt": interval},
+        "t": {"ax": jnp.asarray(t_ax), "dt": stride * grid_dt},
         "func": save_func,
         "field": field,
         "ix": ix,
