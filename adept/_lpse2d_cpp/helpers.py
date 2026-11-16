@@ -1725,6 +1725,28 @@ def continue_step_sequence(tmin: float, period: float, dt: float, t_restart: flo
     return first * dt
 
 
+def ps_string(t: float) -> str:
+    """``t`` (ps) as a config time string that reads back to the same float. A rounded string (e.g. 12
+    significant digits) can move a step time n dt past ``n dt + 1e-9 dt``, the guard of
+    ``step_save_times``, and a resumed save then lands one step late."""
+    return f"{float(t)!r}ps"
+
+
+def solver_dt0(t0: float, t1: float, dt: float) -> float:
+    """The ``dt0`` to hand diffrax so that it takes exactly ``n = ceil((t1 - t0) / dt)`` steps over [t0, t1]
+    (all in ps), with ``t1 - t0`` a whole number of steps to round-off.
+
+    diffrax's ``ConstantStepSize`` takes ``ceil((t1 - t0) / nextafter(dt0))`` steps. With ``dt0 = dt`` the
+    float ``t1 - t0`` of a resumed segment (``t0 = n0 dt``) can round above ``n dt`` by more than one ulp of
+    ``n``, and the segment takes n + 1 steps. adept's ``Stepper`` advances a full ``dt`` on every step, so
+    the extra step overruns ``t1`` by ``dt`` and every save of the segment then falls between steps.
+    ``dt0 = (t1 - t0) / n`` is the case ``nextafter`` guards: the count is exactly n, and the step times
+    ``t0 + (t1 - t0) k / n`` are the same as with ``dt0 = dt``.
+    """
+    n = max(math.ceil((t1 - t0) / dt - 1.0e-9), 1)
+    return (t1 - t0) / n
+
+
 def get_save_quantities(cfg: dict) -> dict:
     """
     This function updates the config with the quantities required for the diagnostics and saving routines

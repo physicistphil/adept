@@ -16,6 +16,8 @@ from adept._lpse2d_cpp.helpers import (
     get_save_quantities,
     get_solver_quantities,
     post_process,
+    ps_string,
+    solver_dt0,
     write_units,
 )
 from adept._lpse2d_cpp.modules import driver
@@ -65,6 +67,8 @@ class BaseLPSE2D(ADEPTModule):
             "save_t0": t0,
             "save_t1": self.cfg["grid"]["tmax"],
             "save_nt": self.cfg["grid"]["tmax"],
+            # whole steps of grid.dt over [t0, tmax], also for a restart (see solver_dt0)
+            "dt0": solver_dt0(t0, self.cfg["grid"]["tmax"], self.cfg["grid"]["dt"]),
         }
 
         subs = {
@@ -145,7 +149,7 @@ class BaseLPSE2D(ADEPTModule):
                                 t_cfg["restart_exhausted"] = True
                         else:
                             tmin = self.restart_t0
-                        t_cfg["tmin"] = f"{tmin:.12g}ps"
+                        t_cfg["tmin"] = ps_string(tmin)
             # the default series samples the grid's time axis: keep only the resumed interval
             t_axis = np.asarray(self.cfg["grid"]["t"])
             kept = t_axis[t_axis >= self.restart_t0 - 1.0e-12]
@@ -177,7 +181,7 @@ class BaseLPSE2D(ADEPTModule):
             t0=self.time_quantities["t0"],
             t1=self.time_quantities["t1"],
             max_steps=self.cfg["grid"]["max_steps"] + 2048,
-            dt0=self.cfg["grid"]["dt"],
+            dt0=self.time_quantities["dt0"],
             y0=state,
             args=args,
             saveat=SaveAt(**self.diffeqsolve_quants["saveat"]),

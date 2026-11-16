@@ -457,7 +457,7 @@ class HybridParticleEvolution:
     def _apply_boundaries(self, x: Array, u: Array, t: float):
         out_left, out_right = x < self.xmin, x > self.xmax
         any_out = out_left | out_right
-        key, therm_key = jax.random.split(jax.random.fold_in(self.wall_key, jnp.asarray(t / self.dt).astype(jnp.int32)))
+        key, therm_key = jax.random.split(jax.random.fold_in(self.wall_key, jnp.round(t / self.dt).astype(jnp.int32)))
         uni = jax.random.uniform(key, (self.n_p,), minval=1.0e-12, maxval=1.0)
         speed = jnp.minimum(jnp.sqrt(self.v_min**2 - 2.0 * self.vte**2 * jnp.log(uni)), 0.99 * self.c)
         u_new = speed / jnp.sqrt(1.0 - (speed / self.c) ** 2)
@@ -526,7 +526,7 @@ class HybridParticleEvolution:
         )
 
         step_key, therm_key = jax.random.split(
-            jax.random.fold_in(self.wall_key, jnp.asarray(t / self.dt).astype(jnp.int32))
+            jax.random.fold_in(self.wall_key, jnp.round(t / self.dt).astype(jnp.int32))
         )
         normal_velocity, tangential_velocity = self._sample_flux_weighted_tail(step_key)
         x_sign = jnp.where(out_left, 1.0, -1.0)

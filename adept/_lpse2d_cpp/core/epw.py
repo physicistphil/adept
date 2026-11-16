@@ -622,8 +622,9 @@ class SpectralEPWSolver:
             Random noise in k-space
         """
         # Per-step key: deterministic in (noise_seed, step), and statistically
-        # independent across both steps and seeds (see __init__)
-        step = (t / self.dt).astype(int)
+        # independent across both steps and seeds (see __init__). Rounded, not truncated: the solver's
+        # step time can sit just below n dt, and truncation would reuse step n-1's key
+        step = jnp.round(t / self.dt).astype(int)
         key = jax.random.fold_in(self.noise_key, step)
 
         # Random phases

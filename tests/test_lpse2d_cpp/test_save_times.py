@@ -114,3 +114,21 @@ def test_free_epw_mode_series_is_conserved_at_every_save():
     np.testing.assert_allclose(np.abs(mode) ** 2 / np.abs(mode[0]) ** 2, 1.0, rtol=CONSERVATION_RTOL)
     theta = np.angle(mode[2] / mode[1])  # the phase advance over one step
     assert 1.0 - math.cos(theta) >= MIN_ONE_MINUS_COS, f"theta = {theta:.3f} rad per step: the check is insensitive"
+
+
+def test_resumed_save_start_reads_back_on_its_step():
+    """On restart the next scheduled save time is written back into save.*.t.tmin as a string. It must
+    read back onto the same step: at dt = 1/3 fs a 12-significant-digit string moved the first resumed
+    save one step late in 461 of 2000 random cases. Exact step equality in every case."""
+    from adept._lpse2d_cpp.helpers import _Q, continue_step_sequence, ps_string, step_save_times
+
+    rng = np.random.default_rng(0)
+    for dt in (1.0e-3 / 3.0, 1.0e-3, 0.7e-3, 0.01 / math.ceil(0.01 / 0.00137)):
+        for _ in range(2000):
+            stride = int(rng.integers(1, 50))
+            period = stride * dt
+            t_restart = int(rng.integers(100, 60000)) * dt
+            tmin = continue_step_sequence(0.0, period, dt, t_restart)
+            tmin_read = _Q(ps_string(tmin)).to("ps").value
+            times, _ = step_save_times(tmin_read, tmin_read + 3 * period, period, dt)
+            assert round(times[0] / dt) == round(tmin / dt)
