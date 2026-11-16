@@ -97,7 +97,7 @@ def _cfg(
     )  # 1e-12: the noise-driven EPW energy after N_STEPS is ~2x the seeded one, not 1e16x
     cfg["terms"]["light"] = {"solver": light_solver, "pump_depletion": pump_depletion}
     if iaw:
-        cfg["terms"]["iaw"] = {"active": True, "solver": "spectral"}
+        cfg["terms"]["iaw"] = {"active": True, "solver": "spectral", "damping": {"landau": 0.0}}
     if hpe:
         cfg["terms"]["hpe"] = {"active": True, "n_particles": 4000, "seed": 3, "n_angles": 8, "gather_refine": 1}
     if qle:

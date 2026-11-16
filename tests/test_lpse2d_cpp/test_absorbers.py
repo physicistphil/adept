@@ -204,7 +204,13 @@ def test_iaw_absorber_acts_over_the_iaw_step(solver):
     from adept._lpse2d_cpp.core.iaw import IonAcousticWave
 
     raw = _raw()
-    raw["terms"]["iaw"] = {"active": True, "solver": solver, "stride": 2, "boundary_width": "1.0um"}
+    raw["terms"]["iaw"] = {
+        "active": True,
+        "solver": solver,
+        "stride": 2,
+        "boundary_width": "1.0um",
+        "damping": {"landau": 0.0},
+    }
     cfg = _finish(raw)
     rate = np.asarray(cfg["grid"]["iaw_absorbing_rate"])
     assert rate.max() > 0.0

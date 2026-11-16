@@ -282,9 +282,9 @@ def test_invalid_coupling_and_filter_are_rejected():
 
 def test_fd_rotation_refuses_the_transverse_source_projection_it_cannot_apply():
     """The fd rotation exchange is pointwise and never applied terms.light.transverse_source (PR #372
-    review): with SRS on, true is refused instead of silently ignored; false (the default) sets up,
-    and so do coupling: explicit and the spectral solver (which keeps the fields transverse instead)
-    with true, and rotation with transverse_fields: true."""
+    review): with SRS on, true (the default) is refused instead of silently ignored unless
+    transverse_fields: true projects the fields once per EPW step; false sets up, and so do
+    coupling: explicit and the spectral solver (which keeps the fields transverse instead) with true."""
     from adept._lpse2d_cpp.core.light import CoupledLight
     from adept._lpse2d_cpp.core.spectral_light import SpectralCoupledLight
 
@@ -293,14 +293,16 @@ def test_fd_rotation_refuses_the_transverse_source_projection_it_cannot_apply():
     assert CoupledLight(cfg).coupling == "rotation"
     default = deepcopy(cfg)
     del default["terms"]["light"]["transverse_source"]
-    assert not CoupledLight(default).transverse_source
+    with pytest.raises(ValueError, match=r"transverse_source"):
+        CoupledLight(default)
     refused = deepcopy(cfg)
     refused["terms"]["light"]["transverse_source"] = True
     with pytest.raises(ValueError, match=r"transverse_source"):
         CoupledLight(refused)
-    fields = deepcopy(cfg)
+    fields = deepcopy(default)
     fields["terms"]["light"]["transverse_fields"] = True
-    assert CoupledLight(fields).transverse_fields
+    light = CoupledLight(fields)
+    assert light.transverse_fields and light.transverse_source
     explicit = _make_cfg(coupling="explicit")
     explicit["terms"]["light"]["transverse_source"] = True
     assert CoupledLight(explicit).transverse_source
@@ -342,7 +344,13 @@ def _coupled_light_one_way(one_way=True):
 
     with open("tests/test_lpse2d_cpp/configs/srs.yaml") as fi:
         cfg = yaml.safe_load(fi)
-    cfg["terms"]["light"] = {"pump_depletion": True, "coupling": "rotation", "one_way": one_way}
+    # the fd rotation exchange cannot project its sources (refused with the default true)
+    cfg["terms"]["light"] = {
+        "pump_depletion": True,
+        "coupling": "rotation",
+        "one_way": one_way,
+        "transverse_source": False,
+    }
     cfg["terms"]["epw"]["boundary"]["x"] = "absorbing"
     cfg["mlflow"]["experiment"] = "test-lpse2d-light-coupling"
     exo = ergoExo()

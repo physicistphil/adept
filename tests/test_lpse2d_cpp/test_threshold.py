@@ -69,6 +69,69 @@ def test_lpse_search_converges_with_the_gain_criterion():
     assert abs(result["history"][1][0] - 1.5e14) < 1.0
 
 
+def _lpse_update_laser_intensity_sequence(i0, d_i_fract, n_iter, is_above, max_runs=200):
+    """A line-by-line transcription of LPSE's AbsoluteThreshold::updateLaserIntensity
+    (AbsoluteThreshold.cpp:143-250): the intensities it runs, and the final threshold."""
+    step = initial_step = d_i_fract * i0
+    intensity, stage, n_two, first_above = i0, 0, 0, None
+    ran = []
+    while len(ran) < max_runs:
+        ran.append(intensity)
+        above = is_above(intensity)
+        if stage == 0:
+            first_above = above
+            intensity += -step if above else step
+            stage = 1
+        elif stage == 1:
+            if first_above:
+                if above:
+                    intensity -= step
+                else:
+                    stage, step = 2, step / 2
+                    intensity += step
+            else:
+                if above:
+                    stage, step = 2, step / 2
+                    intensity -= step
+                else:
+                    intensity += step
+            if stage == 1 and intensity <= initial_step / 1000:
+                stage, step = 2, step / 2
+                intensity = step
+        else:
+            n_two += 1
+            step /= 2
+            intensity += -step if above else step
+            if intensity <= 0:
+                n_two += 1
+                step /= 2
+                intensity = step
+            if n_two >= n_iter:
+                return ran, intensity
+    raise AssertionError("reference search did not finish")
+
+
+@pytest.mark.parametrize("true_threshold", [5.0e13, 1.3e14, 1.6e14, 2.0e14, 3.0e14, 7.0e14, 1.2e15, 2.5e15])
+def test_lpse_search_runs_the_same_intensities_as_lpse(true_threshold):
+    """Same deck defaults (dI_fract 0.3333, 5 iterations) and a step-function criterion: the search must
+    run LPSE's intensities and return LPSE's threshold (rtol 1e-12), including thresholds below I0 / 6,
+    which the old "intensity too small" exit could not reach (it re-tested I0 / 3)."""
+    from adept._lpse2d_cpp.threshold import find_threshold_lpse
+
+    i0, gain = 1.0e15, 23.026
+    t = np.linspace(0.0, 1.0, 201)
+
+    def fake_runner(cfg, intensity, run_name):
+        rate = 30.0 if intensity > true_threshold else 0.0  # ln(A_end / A_noise) = 27 > gain, or 0
+        return {"t (ps)": t, "max_rho": 1e-10 * np.exp(rate * np.where(t > 0.1, t - 0.1, 0.0))}
+
+    cfg = {"units": {"laser intensity": f"{i0}W/cm^2"}, "mlflow": {"run": "t"}}
+    result = find_threshold_lpse(cfg, gain=gain, runner=fake_runner)
+    ran, expected = _lpse_update_laser_intensity_sequence(i0, 0.3333, 5, lambda i: i > true_threshold)
+    np.testing.assert_allclose([h[0] for h in result["history"]], ran, rtol=1e-12)
+    np.testing.assert_allclose(result["threshold"], expected, rtol=1e-12)
+
+
 def test_gain_criterion_is_lpse_running_check():
     """Inventory A18 / A29 (AbsoluteThreshold::checkIsAboveThreshold): samples before noiseTimeRange[0]
     are skipped, the noise level is the running mean over [t0, t1), and the first sample with

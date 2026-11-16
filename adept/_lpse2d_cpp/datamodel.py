@@ -375,8 +375,10 @@ class LightModel(BaseModel):
     # takeTransversePartOfSourceTerms; for the coupled spectral solver the fields are kept
     # transverse instead). No light propagator moves the longitudinal part of E1, so
     # without this it accumulates the source and pairs with the EPW in a spurious
-    # two-wave instability (41/ps energy growth against LPSE's 5.8/ps in test_006)
-    transverse_source: bool = False  # LPSE takeTransversePartOfSourceTerms default false
+    # two-wave instability (41/ps energy growth against LPSE's 5.8/ps in test_006). On by
+    # default for that reason; LPSE's own default is false (its reference decks set it true),
+    # and translated decks carry the deck's value
+    transverse_source: bool = True
     # fd solver: project the evolved light fields (E0 with pump depletion, E1) onto their
     # transverse part once per EPW step. The FD curl-curl propagator's discrete divergence
     # is not zero, so 2-D-structured transverse fields acquire a longitudinal part every
@@ -449,11 +451,13 @@ class IAWDampingModel(BaseModel):
     """Ion-acoustic damping. ``landau_form: simplified`` is ``gamma = landau * cs * |k|``
     (LPSE ``isSimplified``); ``full`` is the Z-generalized Krall-Trivelpiece rate with its
     ``k lambda_D`` and ``Z Te/Ti`` dependence (``iaw.ion_landau_rate``), in which case
-    ``landau`` is ignored. ``collisions`` (1/ps) damps ``n`` as ``(1 - nu dt)`` in the
-    explicit solver and ``div v`` as ``exp(-2 nu dt)`` in the spectral one (LPSE)."""
+    ``landau`` is ignored. ``collisions`` is the amplitude damping rate nu (1/ps): every solver
+    damps ``div v`` as ``exp(-2 nu dt)``, as LPSE does. ``landau`` has no default with the
+    simplified form: an unset rate would silently run undamped ion-acoustic waves (LPSE's default
+    0), so it must be given (0 for an undamped wave)."""
 
-    collisions: float = 0.0  # density damping rate, 1/ps (LPSE iaw.damping default 0)
-    landau: float = 0.0  # gamma_iaw = landau * cs * |k| (LPSE default 0)
+    collisions: float = 0.0  # amplitude damping rate nu, 1/ps (LPSE iaw.collisionalDampingRate default 0)
+    landau: float | None = None  # gamma_iaw = landau * cs * |k|; required with landau_form: simplified
     landau_form: Literal["simplified", "full"] = "simplified"
 
 

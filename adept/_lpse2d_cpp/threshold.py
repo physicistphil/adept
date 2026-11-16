@@ -211,25 +211,33 @@ def find_threshold_lpse(
     first_above = above(intensity, "stage0")
     direction = -1.0 if first_above else 1.0
     intensity += direction * step
-    # stage 1: march until the criterion flips
+    # stage 1 (AbsoluteThreshold.cpp:172-209): march until the criterion flips
     for n in range(max_stage_one_steps):
         result = above(intensity, f"stage1-{n}")
         if result != first_above:
+            # flipped: halve the step and go half a step back towards the last unflipped intensity
+            step /= 2.0
+            intensity -= direction * step
             break
         intensity += direction * step
         if intensity <= initial_step / 1000.0:
-            intensity = step / 2.0
+            # marched down to ~zero without a flip: stage 2 starts at half the step (LPSE sets
+            # intensityStepSize /= 2; intensity = intensityStepSize)
+            step /= 2.0
+            intensity = step
             break
     else:
         raise ValueError("find_threshold_lpse: stage 1 did not bracket the threshold in max_stage_one_steps")
-    # stage 2: halving steps back towards the flip (LPSE halves on entering stage 2 too)
-    step /= 2.0
-    intensity -= direction * step
-    for n in range(n_iter):
+    # stage 2 (AbsoluteThreshold.cpp:220-245): n_iter halving steps; a reset of a non-positive
+    # intensity counts as an iteration, as in LPSE
+    n = 0
+    while n < n_iter:
         result = above(intensity, f"stage2-{n}")
+        n += 1
         step /= 2.0
         intensity += (-step) if result else step
         if intensity <= 0.0:
+            n += 1
             step /= 2.0
             intensity = step
     return {"threshold": float(intensity), "history": history}

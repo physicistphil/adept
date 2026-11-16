@@ -105,6 +105,53 @@ def test_iaw_landau_damps_velocity_at_twice_the_amplitude_rate():
     np.testing.assert_allclose(out["iaw_velocity_divergence"], expected, rtol=1e-11, atol=1e-13)
 
 
+def test_iaw_collisions_damp_velocity_at_twice_the_amplitude_rate_in_every_solver():
+    """terms.iaw.damping.collisions is the wave's amplitude damping rate nu in every solver: the
+    explicit step damps W by exp(-2 nu dt) and leaves n alone, as the spectral one (LPSE) does (the
+    MATLAB step damped n by 1 - nu dt, i.e. the amplitude at nu / 2). Exact to round-off."""
+    from adept._lpse2d_cpp.core.iaw import IonAcousticWave
+
+    nu = 3.0  # 1/ps
+    cfg = _make_cfg(collisions=nu)
+    solver = IonAcousticWave(cfg)
+    x = np.asarray(cfg["grid"]["x"])
+    k = np.asarray(cfg["grid"]["kx"])[4]
+    velocity = jnp.asarray(np.cos(k * (x - x[0])))[:, None]
+    state = {**_zero_fields(cfg), "iaw_density": jnp.zeros_like(velocity), "iaw_velocity_divergence": velocity}
+    out = solver(state)
+    np.testing.assert_allclose(
+        out["iaw_velocity_divergence"], velocity * np.exp(-2.0 * nu * solver.dt), rtol=1e-11, atol=1e-13
+    )
+    # n drifts by the damped W and is not damped again
+    np.testing.assert_allclose(
+        out["iaw_density"], -solver.dt * velocity * np.exp(-2.0 * nu * solver.dt), rtol=1e-11, atol=1e-13
+    )
+    assert solver.collisional_w_factor == np.exp(-2.0 * nu * solver.dt)
+
+
+def test_iaw_without_a_landau_rate_is_refused():
+    """An unset terms.iaw.damping.landau would run undamped ion-acoustic waves; it is refused with the
+    simplified form, accepted when given (0 included) or with landau_form: full."""
+    import pytest
+
+    from adept._lpse2d_cpp.helpers import get_derived_quantities, write_units
+
+    def derived(damping):
+        with open("tests/test_lpse2d_cpp/configs/epw.yaml") as fi:
+            cfg = yaml.safe_load(fi)
+        cfg["density"] = {"basis": "uniform", "val": 0.25}
+        cfg["terms"]["iaw"] = {"active": True, "damping": damping}
+        write_units(cfg)
+        return get_derived_quantities(cfg)["terms"]["iaw"]["damping"]
+
+    with pytest.raises(ValueError, match=r"terms\.iaw\.damping\.landau is required"):
+        derived({})
+    with pytest.raises(ValueError, match=r"terms\.iaw\.damping\.landau is required"):
+        derived({"collisions": 0.5})
+    assert derived({"landau": 0.0})["landau"] == 0.0
+    assert derived({"landau_form": "full"})["landau_form"] == "full"
+
+
 def test_light_intensity_drives_iaw_and_density_limiter():
     """The pump ponderomotive pressure drives W; the optional Nelf limiter is applied last."""
     from adept._lpse2d_cpp.core.iaw import IonAcousticWave
@@ -203,7 +250,7 @@ def test_iaw_configuration_defaults_to_epw_boundaries():
     fresh["density"] = {"basis": "uniform", "val": 0.25}
     fresh["grid"]["ymax"] = "0.02um"
     fresh["grid"]["ymin"] = "-0.02um"
-    fresh["terms"]["iaw"] = {"active": True, "boundary": None}
+    fresh["terms"]["iaw"] = {"active": True, "boundary": None, "damping": {"landau": 0.0}}
 
     from adept._lpse2d_cpp.helpers import get_derived_quantities, write_units
 
@@ -225,7 +272,7 @@ def test_iaw_composes_with_quasi_1d_particle_feedback():
     with open("configs/lpse-2d/srs-hpe.yaml") as fi:
         cfg = yaml.safe_load(fi)
     cfg["terms"]["hpe"]["n_particles"] = 64
-    cfg["terms"]["iaw"] = {"active": True}
+    cfg["terms"]["iaw"] = {"active": True, "damping": {"landau": 0.0}}
 
     write_units(cfg)
     cfg = get_derived_quantities(cfg)

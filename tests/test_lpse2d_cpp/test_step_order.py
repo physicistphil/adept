@@ -31,7 +31,7 @@ def _cfg(iaw=None, **light):
     cfg["terms"]["epw"]["source"]["noise"] = False
     cfg["terms"]["light"] = {"solver": "fd", **light}
     if iaw is not None:
-        cfg["terms"]["iaw"] = {"active": True, "solver": "spectral", **iaw}
+        cfg["terms"]["iaw"] = {"active": True, "solver": "spectral", "damping": {"landau": 0.0}, **iaw}
     write_units(cfg)
     cfg = get_derived_quantities(cfg)
     cfg["grid"] = get_solver_quantities(cfg)
@@ -54,7 +54,7 @@ def _cfg_combined():
     cfg["terms"]["epw"]["source"].update({"noise": False, "tpd": True, "srs": True})
     cfg["terms"]["epw"]["solver"] = "combined"
     cfg["terms"]["light"] = {"solver": "spectral", "pump_depletion": False}
-    cfg["terms"]["iaw"] = {"active": True, "solver": "spectral"}
+    cfg["terms"]["iaw"] = {"active": True, "solver": "spectral", "damping": {"landau": 0.0}}
     write_units(cfg)
     cfg = get_derived_quantities(cfg)
     cfg["grid"] = get_solver_quantities(cfg)

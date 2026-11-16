@@ -253,7 +253,11 @@ def test_combined_split_step_runs_with_pump_depletion_iaw_noise_and_reports_tran
     from adept._lpse2d_cpp.helpers import get_default_save_func, get_save_quantities
 
     cfg = _cfg(
-        density=0.22, pump_depletion=True, periodic=False, noise=True, iaw={"active": True, "solver": "spectral"}
+        density=0.22,
+        pump_depletion=True,
+        periodic=False,
+        noise=True,
+        iaw={"active": True, "solver": "spectral", "damping": {"landau": 0.0}},
     )
     # the full-grid field save (tpd.yaml's 0.08 um save spacing is finer than this 0.1 um grid, which
     # the interpolated save refuses since PR #388)
@@ -436,7 +440,7 @@ def test_combined_iaw_drive_is_the_whole_field_at_wp0():
     the transverse part's carrier change and the L-T cross term."""
     from adept._lpse2d_cpp.core.iaw import IonAcousticWave
 
-    cfg = _cfg(iaw={"active": True, "solver": "spectral"})
+    cfg = _cfg(iaw={"active": True, "solver": "spectral", "damping": {"landau": 0.0}})
     iaw = IonAcousticWave(cfg)
     phi = _random_phi(cfg, 1)
     longitudinal = _field_from_phi(phi, cfg)

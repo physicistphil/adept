@@ -461,6 +461,13 @@ def get_derived_quantities(cfg: dict) -> dict:
             iaw["boundary"] = dict(cfg["terms"]["epw"]["boundary"])
         if iaw["damping"]["collisions"] < 0.0:
             raise ValueError("terms.iaw.damping.collisions must be non-negative")
+        if iaw["damping"]["landau"] is None:
+            if iaw["damping"]["landau_form"] == "simplified":
+                raise ValueError(
+                    "terms.iaw.damping.landau is required with landau_form: simplified (gamma = landau cs |k|; "
+                    "0 runs undamped ion-acoustic waves), or set landau_form: full for the Krall-Trivelpiece rate"
+                )
+            iaw["damping"]["landau"] = 0.0  # ignored by the full form
         if iaw["damping"]["landau"] < 0.0:
             raise ValueError("terms.iaw.damping.landau must be non-negative")
         max_dn = iaw["max_density_perturbation"]

@@ -40,10 +40,11 @@ terms:
       srs: false
 ```
 
-The core port defaults to the C++ TPD source, while thermal noise and exponential
-absorbers are explicit options (`terms.epw.source.noise_model: thermal` and
-`grid.boundary_profile: exp`). Its hand-written deck defaults remain flat noise
-and tanh absorbers. The LPSE deck translator selects the LPSE conventions.
+The solver defaults to the C++ TPD source, LPSE's thermal EPW noise
+(`terms.epw.source.noise_model: thermal`) and LPSE's exponential absorbers
+(`grid.boundary_profile: exp`); see "Defaults changed against the 11-02 port" below for every
+default that differs from the first `_lpse2d_cpp` release. The LPSE deck translator selects the
+LPSE conventions.
 
 Example decks live in `configs/lpse-2d/`. To run one:
 
@@ -239,6 +240,30 @@ The deck translator writes LPSE's value except where noted, so these matter for 
 | `terms.hpe.energy_conservation_steps` | 1 | 10 |
 | `terms.hpe.nv` | 512 (also for translated decks without `hpe.velocityGrid`) | 300 |
 | `terms.hpe.thermalization_probability` | follows the field boundaries | (1, 0, 0) (the translator writes (1, 0)) |
+| `terms.light.transverse_source` | `true`: without the projection the longitudinal part of `E1` accumulates the SRS source and pairs with the EPW in a spurious instability (41/ps against LPSE's 5.8/ps in the test_006 cross-check) | `false` (its reference decks set `true`) |
+| `terms.iaw.damping.landau` | none: required with `landau_form: simplified`, so that an IAW is never undamped by omission | 0 |
+
+### Defaults changed against the 11-02 port
+
+Hand-written configs that leave these unset behave differently from the first `_lpse2d_cpp` release
+(PR #372). Translated decks write every one of them.
+
+| Option | 11-02 port | now | consequence |
+|--------|-----------|-----|-------------|
+| `terms.epw.source.noise_model` | `flat` | `thermal` | LPSE fluctuation-dissipation noise |
+| `grid.boundary_profile` | `tanh` | `exp` | LPSE's exponential absorbing layer |
+| `terms.epw.damping.landau_form` | `matlab` | `relativistic` | LPSE's `isRelativistic` default |
+| `terms.epw.source.srs_k_filter` | `true` | `false` | the filter's zero-detuning cutoff removed the resonant mode below the envelope density |
+| `drivers.E0.beam_sg_order` | 2 | 4 | the same `beam_width` is an order-4 super-Gaussian (1.22x the power at equal peak) |
+| `drivers.E0/E1.turn_on_time` | 10 fs | 30 fs | LPSE `riseTime`; slower ramp |
+| `terms.iaw.solver` | `explicit` | `spectral` | exact per-mode propagator, no CFL limit |
+| `terms.iaw.damping.landau` | 0.1 | required (simplified form) | an unset rate is refused |
+| `terms.iaw.damping.collisions` | 1e-5 /ps | 0 | collisionless; `collisions` is now the amplitude rate in every solver (the explicit step used to damp the amplitude at half of it) |
+| `terms.hpe.omega_res` | `bohm_gross` | `lpse` | the HPE resonance is read at the envelope model's own dispersion `wp0 + 3 k^2 vte^2 / (2 wp0)` |
+| step order | light before EPW | EPW before light | LPSE's order; not restorable |
+| static pump swelling | local | constant | restorable with `drivers.E0.swelling: local` |
+
+`terms.light.transverse_source` changed from `true` to `false` with the plan-2 work and is back to `true`.
 
 ### Translator restrictions
 

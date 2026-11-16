@@ -19,8 +19,9 @@ Two time integrators are available (``terms.iaw.solver``):
 
 ``explicit`` (the ``isEvolveIaw`` split-step path of ``m201805_matlabLpse_v11.m``):
 kick ``w`` from the potential with the FD Laplacian, apply twice the amplitude
-Landau rate to ``w``, drift ``n``; boundary damping acts on ``w`` and collisions
-act on ``n`` after the split step. Conditionally stable, ``omega_max dt < 2``.
+Landau rate and twice the collisional rate to ``w`` (as the spectral path does; the MATLAB
+step damped ``n`` by ``1 - nu dt`` instead), drift ``n``; boundary damping acts on ``w``.
+Conditionally stable, ``omega_max dt < 2``.
 
 ``spectral`` (the original LPSE ``iaw.solver = spectral`` path,
 ``ZakharovSolver.cpp`` lines 2083-2113): per k-mode the exact solution over
@@ -215,8 +216,10 @@ class IonAcousticWave:
         k_sq_np = np.asarray(self.k_sq)
         self.landau_rate = jnp.asarray(ion_landau_rate(cfg, k_sq_np))
         self.nu_coll = float(damping["collisions"])
-        # explicit (MATLAB): collisions act on n as (1 - nu dt); spectral (LPSE): on w as e^{-2 nu dt}
-        self.collisional_factor = 1.0 - self.nu_coll * self.dt
+        # every solver damps w = div v by e^{-2 nu dt} (LPSE), so nu is the amplitude damping rate of
+        # the wave, the rate the noise's fluctuation-dissipation balance assumes (the MATLAB explicit
+        # step damped n by (1 - nu dt), i.e. the amplitude at nu / 2)
+        self.collisional_w_factor = float(np.exp(-2.0 * self.nu_coll * self.dt))
         self.max_density_perturbation = iaw["max_density_perturbation"]
 
         # uniform background flow (Mach number along x, y) -> Doppler phase in the propagator;
@@ -254,7 +257,6 @@ class IonAcousticWave:
             self.p_nw = jnp.asarray(-coeff * sin_over_b)
             self.p_wn = jnp.asarray(coeff * sin_over_b * omega_sq)
             self.p_ww = jnp.asarray(coeff * (cos_b - sin_over_b * gamma))
-            self.collisional_w_factor = float(np.exp(-2.0 * self.nu_coll * self.dt))
 
         # IAW noise (LPSE IawSolver::addNoise): random-phase source on the velocity
         # divergence with the fluctuation-dissipation amplitude
@@ -459,12 +461,12 @@ class IonAcousticWave:
                 y["epw"], y["E0"], y["E1"], y["iaw_density"]
             )
         velocity_k = jnp.fft.fft2(velocity_divergence)
-        velocity_k = velocity_k * jnp.exp(-2.0 * self.landau_rate * self.dt) * self.filter
+        velocity_k = velocity_k * jnp.exp(-2.0 * self.landau_rate * self.dt) * self.collisional_w_factor * self.filter
         if self.noise_enabled:
             velocity_k = velocity_k + self.get_noise(t)
         velocity_divergence = jnp.real(jnp.fft.ifft2(velocity_k)) * self.boundary
 
-        density = (y["iaw_density"] - self.dt * velocity_divergence) * self.collisional_factor
+        density = y["iaw_density"] - self.dt * velocity_divergence
         return density, velocity_divergence
 
     def _spectral_step(self, t: float, y: dict[str, Array]) -> tuple[Array, Array]:

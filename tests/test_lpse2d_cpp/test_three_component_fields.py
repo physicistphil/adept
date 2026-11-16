@@ -55,7 +55,7 @@ def _cfg(*, epw_solver="separate", light_solver="fd", pump_depletion=True, tpd=F
     cfg["terms"]["epw"]["source"].update({"noise": False, "tpd": tpd, "srs": srs})
     cfg["terms"]["light"] = {"solver": light_solver, "pump_depletion": pump_depletion}
     if iaw:
-        cfg["terms"]["iaw"] = {"active": True, "solver": "spectral"}
+        cfg["terms"]["iaw"] = {"active": True, "solver": "spectral", "damping": {"landau": 0.0}}
     return _finish(cfg)
 
 

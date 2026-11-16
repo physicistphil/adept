@@ -52,7 +52,7 @@ def _cfg(*, epw_window=None, iaw=None, light=None, seed=False, tpd=False):
         cfg["terms"]["epw"]["source_window"] = epw_window
     cfg["terms"]["light"] = {"solver": "fd", "pump_depletion": True, **(light or {})}
     if iaw is not None:
-        cfg["terms"]["iaw"] = {"active": True, "solver": "spectral", **iaw}
+        cfg["terms"]["iaw"] = {"active": True, "solver": "spectral", "damping": {"landau": 0.0}, **iaw}
     if seed:
         cfg["drivers"]["E1"] = {"intensity": "1e12W/cm^2", "offset": "0.8um"}
     return _finish(cfg)
