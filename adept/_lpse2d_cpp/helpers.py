@@ -1125,9 +1125,11 @@ def _lpse_density_profile(cfg: dict) -> np.ndarray:
 
 
 def plot_fields(fields, td):
-    t_skip = int(fields.coords["t (ps)"].data.size // 8)
+    n_t = fields.coords["t (ps)"].data.size
+    t_skip = int(n_t // 8)
     t_skip = t_skip if t_skip > 1 else 1
-    tslice = slice(0, -1, t_skip)
+    # every t_skip-th save but the last; a single save (e.g. a resumed segment) is plotted as is
+    tslice = slice(0, -1, t_skip) if n_t > 1 else slice(None)
 
     ny = fields.coords["y (um)"].data.size
 
@@ -1177,9 +1179,10 @@ def plot_fields(fields, td):
 
 
 def plot_kt(kfields, td):
-    t_skip = int(kfields.coords["t (ps)"].data.size // 6)
+    n_t = kfields.coords["t (ps)"].data.size
+    t_skip = int(n_t // 6)
     t_skip = t_skip if t_skip > 1 else 1
-    tslice = slice(0, -1, t_skip)
+    tslice = slice(0, -1, t_skip) if n_t > 1 else slice(None)  # a single save is plotted as is
 
     for abs_kmax in [2.5, 1.25]:
         # k_min = -2.5
