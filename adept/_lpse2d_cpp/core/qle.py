@@ -7,33 +7,48 @@ spectrum,
 
     df/dt = d/dv_i ( C_ij(v) df/dv_j ),
 
-    C_ij(v) = (pi/2) (e/m)^2 (Lx Ly / (2 pi)^2) (1/v) sum_perp dk_perp  k_i k_j |phi_k / N|^2
+    C_ij(v) = (pi/2) (e/m)^2 sum_k k_i k_j |phi_k / N|^2 delta(w_k - k . v)
 
-with the sum over the resonant plane ``k . v = w(k)`` (``w = wpe`` cold, or the Bohm-Gross
-``sqrt(wpe^2 + 3 vte^2 k^2)`` with ``thermal_correction``), parametrised as LPSE does:
-``k_par = sqrt(wpe^2 + 3 vte^2 k_perp^2) / sqrt(v^2 - 3 vte^2)`` along ``v``, ``k_perp`` on
-``nx`` points across ``[-k_max sqrt(nDim), k_max sqrt(nDim)]``, ``|phi_k|^2`` interpolated on
-the periodic k grid (``getDiffusionCoefficient``). The ``1/v`` above is the resonance
-Jacobian ``1/|v - v_g|`` with the Bohm-Gross group velocity when ``thermal_correction`` is on
-(LPSE keeps the cold ``1/v`` there, under-counting the exchange by ``3 (k lambda_D)^2 wpe^2 / w_k^2``);
-the constant is derived in this code's scaled-Gaussian units from the envelope field
-``E = Re(E_env e^{-i wpe t})`` -- the +-k pair of an envelope mode shares one phase velocity,
-hence pi/2 with ``|E_env,k|^2`` -- and verified by the wave-energy / electron-heating balance
-(tests/test_lpse2d_cpp/test_qle.py). The
-explicit update (``updateVelocityDistribution_explicit``) is sub-cycled to the diffusion
+summed over the retained modes of the periodic box (``w = wpe`` cold, or the Bohm-Gross
+``sqrt(wpe^2 + 3 vte^2 k^2)`` with ``thermal_correction``). The constant is derived in this
+code's scaled-Gaussian units from the envelope field ``E = Re(E_env e^{-i wpe t})`` -- the +-k
+pair of an envelope mode shares one phase velocity, hence pi/2 with ``|E_env,k|^2`` -- and
+verified by the wave-energy / electron-heating balance (tests/test_lpse2d_cpp/test_qle.py).
+
+Each mode's resonance is deposited onto the velocity grid as a cell average: in 1-D the point
+``v = w_k / k`` with linear (cloud-in-cell) weights, in 2-D the line ``k^ . v = w_k / |k|``
+(``delta(w_k - k . v) = delta(k^ . v - v_phase) / |k|``) sampled every ``dv / 2`` with bilinear
+weights. Every mode therefore heats the electrons it damps, however fine the k grid. (LPSE --
+and this port before -- samples the continuum form ``C(v) ~ |phi(k_res(v))|^2 / |v - v_g|`` at
+the velocity nodes only; on a box whose k spacing is finer than a velocity cell's k-space
+footprint ``k^2 dv / w`` most modes fell between the samples and were damped without heating
+anything: 0 of 12 adjacent modes at Lx = 128 um with nv = 100.)
+
+The explicit update (``updateVelocityDistribution_explicit``) is sub-cycled to the diffusion
 limit ``dv^2 / (2 nDim max C)`` -- in conservative flux form here rather than LPSE's
 ``C d^2 f + (d_i C_ij) d_j f`` (see ``_flux_increment``; ``derivative_in_tensor`` is
 accepted from the deck and implied) -- relaxes ``f`` towards the Maxwellian at
 ``p_x |v_x| / Lx + p_y |v_y| / Ly`` (particles leaving the box return thermalised with
-``thermalization_probability``), clips ``f >= 0`` and renormalises the density. With
-``landau_evolution`` the Landau rate of every EPW mode is recomputed from
-the evolved ``f`` (``updateLandauDamping``),
+``thermalization_probability``), clips ``f >= 0`` and renormalises the density.
 
-    gamma_L(k) = -(pi/2) wpe^3 / k^3  sum_perp dv_perp  k . grad_v f |_{v = v_phase k^ + v_perp}
+With ``landau_evolution`` the Landau rate of every EPW mode follows the evolved ``f``
+(``updateLandauDamping``). The slope functional
 
-(the reduced distribution along ``k``; the Maxwellian gives the textbook rate), and written
-to the state's ``gamma_L`` that the EPW step applies; modes with ``v_phase > v_max`` are
-undamped, as in LPSE. Every ``update_every`` EPW steps from ``t_start``.
+    S_k[f] = -(pi/2) wpe^3 / k^3  sum_perp dv_perp  k . grad_v f |_{v = v_phase k^ + v_perp}
+
+(the reduced distribution along ``k``) is the non-relativistic rate of ``f``; LPSE applies it as
+is. Here it is calibrated per mode to the configured fluid rate (``terms.epw.damping``: its form,
+``landau_lower_threshold`` and ``landau_multiplier``),
+
+    gamma_L(k, t) = multiplier * threshold( gamma_form(k) * S_k[f(t)] / S_k[f_M] ),
+
+so the rate starts at the fluid one and changes by the relative change of the resonant slope,
+the discretisation of ``S`` cancelling in the ratio. (The raw ``S_k`` of the non-relativistic
+grid Maxwellian is 1.4-13 times the default relativistic rate at 4 keV for k lambda_D 0.40-0.20,
+so the first update made the damping jump.) Modes whose resonance is off the velocity grid keep
+the fluid rate (LPSE: undamped), and modes whose Maxwellian resonance lies in the unresolved
+tail (``f_M(v_phase) < 1e-25 f_M(0)``) use ``S_k[f]`` uncalibrated. Every ``update_every`` EPW
+steps from ``t_start``.
 """
 
 import equinox.internal as eqxi
@@ -126,46 +141,90 @@ class QuasilinearEvolution:
             rate = rate[:, None] + self.p_therm[1] * np.abs(v)[None, :] / self.Ly
         self.therm_rate = jnp.asarray(rate)
 
-        # k grid and the resonant-plane sampling (LPSE: kMax per axis from the anti-aliasing
-        # range, Nx points across [-kMax sqrt(nDim), +kMax sqrt(nDim)])
+        # k grid (LPSE: kMax per axis from the anti-aliasing range)
         kx = np.asarray(grid["kx"], dtype=np.float64)
         ky = np.asarray(grid["ky"], dtype=np.float64)
         self.kx, self.ky = jnp.asarray(kx), jnp.asarray(ky)
-        self.dkx = 2.0 * np.pi / self.Lx
-        self.dky = 2.0 * np.pi / self.Ly if self.is_2d else 0.0
         band = float(grid.get("low_pass_filter", 1.0))
         self.k_max = np.pi / self.dx * band
-        self.k_max_plane = self.k_max * np.sqrt(self.ndim)
-        if self.is_2d:
-            self.nk_plane = self.nx
-            self.k_perp = jnp.asarray(np.linspace(-self.k_max_plane, self.k_max_plane, self.nk_plane))
-            self.dk_plane = float(2.0 * self.k_max_plane / (self.nk_plane - 1))
-        else:
-            self.nk_plane = 1
-            self.k_perp = jnp.zeros(1)
-            self.dk_plane = 1.0
-        # the plane of the Landau integral: nv points across [-v_max, v_max]
-        if self.is_2d:
-            self.v_perp = self.v
-            self.dv_plane = self.dv
-        else:
-            self.v_perp = jnp.zeros(1)
-            self.dv_plane = 1.0
-        # D_ij constant: (pi/2)(e/m)^2 (Lx Ly/(2 pi)^2) dk_perp  [1-D: (Lx/2 pi)]
-        box = self.Lx * self.Ly / (2.0 * np.pi) ** 2 if self.is_2d else self.Lx / (2.0 * np.pi)
-        self.diffusion_constant = self.multiplier * 0.5 * np.pi * self.q_over_m**2 * box * self.dk_plane
         self.n_cells = self.nx * self.ny
-        # k validity for the Landau update: non-zero, inside the band, phase velocity on the grid
         k_sq = kx[:, None] ** 2 + ky[None, :] ** 2
         k_mag = np.sqrt(k_sq)
         omega = np.sqrt(self.wpe**2 + 3.0 * self.vte_sq * k_sq) if self.thermal_correction else self.wpe
         with np.errstate(divide="ignore", invalid="ignore"):
             v_phase = np.where(k_mag > 0, omega / np.where(k_mag > 0, k_mag, 1.0), np.inf)
         inside = (np.abs(kx)[:, None] <= self.k_max) & (np.abs(ky)[None, :] <= self.k_max)
+
+        # ---- the resonance deposit of C_ij: every retained mode, weight k_i k_j / |k|
+        mode_ix, mode_iy = np.nonzero(inside & (k_mag > 0))
+        mkx, mky = kx[mode_ix], ky[mode_iy]
+        mk = np.sqrt(mkx**2 + mky**2)
+        m_vph = v_phase[mode_ix, mode_iy]
+        self.mode_index = (jnp.asarray(mode_ix), jnp.asarray(mode_iy))
+        comps = [mkx * mkx, mky * mky, mkx * mky] if self.is_2d else [mkx * mkx]
+        self.mode_geometry = jnp.asarray(np.stack(comps, axis=-1) / mk[:, None])
+        self.deposit_constant = self.multiplier * 0.5 * np.pi * self.q_over_m**2
+        if self.is_2d:
+            self.mode_v_phase = jnp.asarray(m_vph)
+            self.mode_khat = jnp.asarray(np.stack([mkx / mk, mky / mk], axis=-1))
+            ds = self.dv / 2.0  # two samples per cell crossing
+            n_s = int(np.ceil(2.0 * np.sqrt(2.0) * self.v_max / ds))
+            self.line_s = jnp.asarray((np.arange(n_s) + 0.5 - 0.5 * n_s) * ds)
+            self.line_ds = ds
+        else:
+            # the resonance v = w_k / k, linear weights on the two nodes about it (static)
+            x = (m_vph * np.sign(mkx) + self.v_max) / self.dv
+            i0 = np.floor(x).astype(np.int64)
+            frac = x - i0
+            idx = np.stack([i0, i0 + 1], axis=-1)
+            w = np.stack([1.0 - frac, frac], axis=-1)
+            ok = (idx >= 0) & (idx < self.nv)
+            self.deposit_index = jnp.asarray(np.where(ok, idx, 0))
+            self.deposit_weight = jnp.asarray(np.where(ok, w, 0.0))
+
+        # ---- the Landau slope functional S_k[f] and its calibration to the fluid rate
+        if self.is_2d:
+            self.v_perp = self.v
+            self.dv_plane = self.dv
+        else:
+            self.v_perp = jnp.zeros(1)
+            self.dv_plane = 1.0
+        # k validity for S: non-zero, inside the band, phase velocity on the grid
         self.k_valid = jnp.asarray((k_mag > 0) & inside & (v_phase <= self.v_max))
         self.v_phase = jnp.asarray(np.where(np.isfinite(v_phase), v_phase, 0.0))
         self.k_mag = jnp.asarray(k_mag)
         self.landau_constant = -0.5 * np.pi * self.wpe**3 * self.dv_plane
+        self._init_landau_calibration(cfg, v_phase)
+
+    def _init_landau_calibration(self, cfg: dict, v_phase: np.ndarray) -> None:
+        """The per-mode calibration ``gamma_form / S_k[f_M]`` and the fluid rate's threshold and
+        multiplier (``terms.epw.damping``)."""
+        from adept._lpse2d_cpp.core.epw import analytic_landau_rate
+
+        damping = cfg["terms"]["epw"]["damping"]
+        form_cfg = {
+            **cfg,
+            "terms": {
+                **cfg["terms"],
+                "epw": {
+                    **cfg["terms"]["epw"],
+                    # the form alone: the threshold and multiplier act on the evolved rate below
+                    "damping": {**damping, "landau": True, "landau_lower_threshold": 0.0, "landau_multiplier": 1.0},
+                },
+            },
+        }
+        gamma_form = np.asarray(analytic_landau_rate(form_cfg), dtype=np.float64)
+        self.landau_threshold = float(damping.get("landau_lower_threshold", 0.0) or 0.0)
+        mult = damping.get("landau_multiplier")
+        self.landau_multiplier = float(mult) if mult is not None else 1.0
+        s_ref = np.asarray(self._slope_rate(self.f0), dtype=np.float64)
+        valid = np.asarray(self.k_valid)
+        with np.errstate(over="ignore", invalid="ignore"):
+            resolved = np.exp(-0.5 * np.where(np.isfinite(v_phase), v_phase, 0.0) ** 2 / self.vte_sq) >= 1.0e-25
+        calibrated = valid & resolved & (s_ref > 0.0)
+        self.landau_calibration = jnp.asarray(np.where(calibrated, gamma_form / np.where(calibrated, s_ref, 1.0), 1.0))
+        # off the velocity grid the fluid rate stays (the VDF does not represent that resonance)
+        self.off_grid_rate = jnp.asarray(np.where(valid, 0.0, gamma_form))
 
     # ----------------------------------------------------------------- tensor --
 
@@ -174,54 +233,37 @@ class QuasilinearEvolution:
         return jnp.abs(phi_k) ** 2 / self.n_cells**2
 
     def diffusion_tensor(self, phi_k: Array) -> Array:
-        """``C_ij(v)`` on the velocity grid: ``(nv, nv, 3)`` [C_xx, C_yy, C_xy] in 2-D, ``(nv, 1)``
-        [C_xx] in 1-D."""
-        phi_sq = self._phi_sq_coef(phi_k)
-        vte_sq, wpe = self.vte_sq, self.wpe
-        k_perp = self.k_perp
+        """``C_ij(v)`` on the velocity grid, the cell average of every mode's resonance:
+        ``(nv, nv, 3)`` [C_xx, C_yy, C_xy] in 2-D, ``(nv, 1)`` [C_xx] in 1-D."""
+        phi_sq = self._phi_sq_coef(phi_k)[self.mode_index]
+        weights = self.deposit_constant * phi_sq[:, None] * self.mode_geometry  # (n_modes, n_comp)
+        if not self.is_2d:
+            c = jnp.zeros(self.nv).at[self.deposit_index.ravel()].add((self.deposit_weight * weights[:, :1]).ravel())
+            return (c / self.dv)[:, None]
+        nv, v_max, dv = self.nv, self.v_max, self.dv
+        vph, khat = self.mode_v_phase, self.mode_khat
+        perp = jnp.stack([-khat[:, 1], khat[:, 0]], axis=-1)
 
-        def at_velocity(v_vec):
-            v_sq = jnp.sum(v_vec**2)
-            v_mag = jnp.sqrt(v_sq)
-            if self.thermal_correction:
-                denom_sq = v_sq - 3.0 * vte_sq
-                valid = (v_mag > 0.0) & (denom_sq > (wpe / self.k_max_plane) ** 2)
-                denom = jnp.sqrt(jnp.where(valid, denom_sq, 1.0))
-                k_par = jnp.sqrt(wpe**2 + 3.0 * vte_sq * k_perp**2) / denom
-                # the resonance Jacobian |d(w_k - k . v)/dk_par| = v - v_g with the Bohm-Gross
-                # group velocity v_g = 3 vte^2 k_par / w_k (LPSE keeps the cold 1/v, which
-                # under-counts the exchange by 3 (k lambda_D)^2 wpe^2 / w_k^2 -- 16 % at 0.25)
-                omega_k = jnp.sqrt(wpe**2 + 3.0 * vte_sq * (k_par**2 + k_perp**2))
-                jacobian = v_mag - 3.0 * vte_sq * k_par / omega_k
-            else:
-                valid = (v_mag > 0.0) & (v_sq > (wpe / self.k_max_plane) ** 2)
-                k_par = wpe / jnp.where(valid, v_mag, 1.0) * jnp.ones_like(k_perp)
-                jacobian = v_mag * jnp.ones_like(k_perp)
-            jacobian = jnp.where(jacobian > 0.0, jacobian, 1.0)
-            v_hat = v_vec / jnp.where(v_mag > 0.0, v_mag, 1.0)
-            if self.is_2d:
-                perp_hat = jnp.array([-v_hat[1], v_hat[0]])
-                kxs = k_par * v_hat[0] + k_perp * perp_hat[0]
-                kys = k_par * v_hat[1] + k_perp * perp_hat[1]
-                on_grid = (jnp.abs(kxs) <= self.k_max) & (jnp.abs(kys) <= self.k_max)
-                coords = [jnp.mod(kxs / self.dkx, self.nx), jnp.mod(kys / self.dky, self.ny)]
-                p = map_coordinates(phi_sq, coords, order=1, mode="wrap")
-                weight = jnp.where(on_grid & valid, p / jacobian, 0.0)
-                c_xx = jnp.sum(weight * kxs * kxs)
-                c_yy = jnp.sum(weight * kys * kys)
-                c_xy = jnp.sum(weight * kxs * kys)
-                return self.diffusion_constant * jnp.array([c_xx, c_yy, c_xy])
-            kxs = k_par * v_hat[0]
-            on_grid = jnp.abs(kxs) <= self.k_max
-            coords = [jnp.mod(kxs / self.dkx, self.nx), jnp.zeros_like(kxs)]
-            p = map_coordinates(phi_sq, coords, order=1, mode="wrap")
-            weight = jnp.where(on_grid & valid, p / jacobian, 0.0)
-            return self.diffusion_constant * jnp.array([jnp.sum(weight * kxs * kxs)])
+        def deposit(m, acc):
+            s = self.line_s[m]
+            x = (vph * khat[:, 0] + s * perp[:, 0] + v_max) / dv
+            y = (vph * khat[:, 1] + s * perp[:, 1] + v_max) / dv
+            i0, j0 = jnp.floor(x), jnp.floor(y)
+            fx, fy = x - i0, y - j0
+            i0, j0 = i0.astype(jnp.int32), j0.astype(jnp.int32)
+            for di, dj, w in (
+                (0, 0, (1 - fx) * (1 - fy)),
+                (1, 0, fx * (1 - fy)),
+                (0, 1, (1 - fx) * fy),
+                (1, 1, fx * fy),
+            ):
+                ii, jj = i0 + di, j0 + dj
+                ok = (ii >= 0) & (ii < nv) & (jj >= 0) & (jj < nv)
+                acc = acc.at[jnp.where(ok, ii * nv + jj, 0)].add(jnp.where(ok, w, 0.0)[:, None] * weights)
+            return acc
 
-        tensor = lax.map(at_velocity, self.v_nodes)
-        if self.is_2d:
-            return tensor.reshape(self.nv, self.nv, 3)
-        return tensor.reshape(self.nv, 1)
+        acc = lax.fori_loop(0, int(self.line_s.shape[0]), deposit, jnp.zeros((nv * nv, 3)))
+        return acc.reshape(nv, nv, 3) * (self.line_ds / dv**2)
 
     # ------------------------------------------------------------- FP update --
 
@@ -316,8 +358,17 @@ class QuasilinearEvolution:
     # ------------------------------------------------------------ Landau rate --
 
     def landau_rate(self, f: Array) -> Array:
-        """``gamma_L(k)`` on the EPW k grid from the evolved ``f`` (0 where the mode's phase
-        velocity is off the grid, as LPSE)."""
+        """``gamma_L(k)`` on the EPW k grid from the evolved ``f``: the fluid rate scaled by the
+        relative change of the resonant slope, ``gamma_form S_k[f] / S_k[f_M]``, then the fluid
+        rate's threshold and multiplier; the fluid rate where the resonance is off the grid."""
+        rate = self.landau_calibration * self._slope_rate(f) + self.off_grid_rate
+        if self.landau_threshold > 0.0:
+            rate = jnp.where(rate > self.landau_threshold, rate, 0.0)
+        return self.landau_multiplier * rate
+
+    def _slope_rate(self, f: Array) -> Array:
+        """``S_k[f]``, the non-relativistic Landau rate of ``f`` on the EPW k grid (LPSE's evolved
+        rate; 0 where the mode's phase velocity is off the grid)."""
         # grad f = f grad(ln f): exact for a Maxwellian on any grid (a plain central difference
         # of the exponential over-estimates |f'| by 20 % at dv = 0.13 vte, LPSE's default).
         # Where a neighbour sits at the floor (the clipped edge of a plateau) ln f jumps by

@@ -55,15 +55,49 @@ def test_landau_rate_of_the_maxwellian_is_the_analytic_one(ny_box):
 
     cfg = _cfg(ny_box, v_max=0.3)
     qle = QuasilinearEvolution(cfg)
-    gamma = np.asarray(qle.landau_rate(jnp.asarray(initial_vdf(cfg))))
+    gamma = np.asarray(qle._slope_rate(jnp.asarray(initial_vdf(cfg))))  # the raw (LPSE) slope functional
     analytic = np.asarray(analytic_landau_rate(cfg))
     valid = np.asarray(qle.k_valid) & (analytic > 1e-3 * cfg["units"]["derived"]["wp0"])
     ratio = gamma[valid] / analytic[valid]
     assert valid.sum() > 20
     assert abs(np.median(ratio) - 1.0) < 0.04
     assert ratio.min() > 0.85 and ratio.max() < 1.05
-    # modes whose phase velocity is off the velocity grid are undamped (LPSE)
+    # the slope functional is 0 where the mode's phase velocity is off the velocity grid (LPSE)
     assert np.all(gamma[~np.asarray(qle.k_valid)] == 0.0)
+
+
+@pytest.mark.parametrize("ny_box", ["0.02um", "3.2um"])
+@pytest.mark.parametrize("form", ["relativistic", "lpse"])
+def test_evolved_rate_starts_at_the_fluid_rate(ny_box, form):
+    """landau_evolution calibrates the slope functional per mode to the configured fluid rate (form,
+    landau_lower_threshold, landau_multiplier): on the Maxwellian it returns that rate (rtol 1e-12),
+    off the velocity grid included (the raw functional was 1.4-13x the relativistic rate at 4 keV and
+    0 off the grid). A flattened slope scales it by the slope ratio."""
+    from adept._lpse2d_cpp.core.epw import analytic_landau_rate
+    from adept._lpse2d_cpp.core.qle import QuasilinearEvolution, initial_vdf
+
+    cfg = _cfg(ny_box, v_max=0.3)
+    damping = cfg["terms"]["epw"]["damping"]
+    damping["landau_form"] = form
+    fluid0 = np.asarray(analytic_landau_rate(cfg))
+    rates = np.unique(fluid0[fluid0 > 0])
+    k20 = len(rates) // 5
+    damping["landau_lower_threshold"] = float(0.5 * (rates[k20] + rates[k20 + 1]))  # between two mode rates
+    damping["landau_multiplier"] = 1.7
+    qle = QuasilinearEvolution(cfg)
+    f0 = jnp.asarray(initial_vdf(cfg))
+    fluid = np.asarray(analytic_landau_rate(cfg))
+    gamma = np.asarray(qle.landau_rate(f0))
+    np.testing.assert_allclose(gamma, fluid, rtol=1e-12, atol=1e-12 * np.max(fluid))
+    assert np.any(fluid[~np.asarray(qle.k_valid)] > 0.0)  # off-grid modes keep a non-zero fluid rate
+    # the rate follows the slope: half the distribution (half of every gradient) halves the
+    # unthresholded rate of every mode on the grid (rtol 1e-12)
+    damping["landau_lower_threshold"] = 0.0
+    qle = QuasilinearEvolution(cfg)
+    half = np.asarray(qle.landau_rate(0.5 * f0))
+    full = np.asarray(qle.landau_rate(f0))
+    on = np.asarray(qle.k_valid)
+    np.testing.assert_allclose(half[on], 0.5 * full[on], rtol=1e-12, atol=1e-300)
 
 
 def test_diffusion_tensor_conserves_wave_plus_electron_energy():
@@ -95,6 +129,58 @@ def test_diffusion_tensor_conserves_wave_plus_electron_energy():
             energy_factor = 1.0 + (wpe**2 + 9.0 * k**2 * vte_sq) / omega**2
             loss += 2.0 * gamma[j] * (k * a) ** 2 / (16.0 * np.pi) * energy_factor
         assert abs(heating / loss - 1.0) < tol, (k_lambda_d, heating / loss)
+
+
+@pytest.mark.parametrize(
+    "ny_box, xmax, nv, k_lambda_d, angles",
+    [
+        ("0.02um", "128um", 481, 0.2, None),  # 12 adjacent modes on a long box
+        ("1.6um", "12.8um", 241, None, [(0.2, 0.0), (0.2, 30.0), (0.25, 60.0), (0.3, 45.0)]),  # oblique 2-D modes
+    ],
+)
+def test_every_damped_mode_heats_the_electrons(ny_box, xmax, nv, k_lambda_d, angles):
+    """C_ij deposits each mode's resonance as a cell average, so a mode's electron heating
+    n m / vte^2 int v . C . v f d^nv matches its exact quasilinear rate
+    n m (pi/2)(e/m)^2 |k| a^2 v_phase^2 f_1(v_phase) / vte^2 for every mode, however fine the k grid
+    (the node-sampled tensor gave 0 for all 12 modes at Lx = 128 um with nv = 100). Tolerance 3 %:
+    the O(dv^2) cell-average error (development check: <= 1.1 % in 1-D at nv 481, <= 1.7 % in 2-D at
+    nv 241)."""
+    from adept._lpse2d_cpp.core.qle import QuasilinearEvolution, initial_vdf
+
+    cfg = _cfg(ny_box, xmax=xmax, nv=nv, v_max=0.6)
+    d = cfg["units"]["derived"]
+    wpe, vte_sq, e, me = d["wp0"], d["vte_sq"], d["e"], d["me"]
+    kx, ky = np.asarray(cfg["grid"]["kx"]), np.asarray(cfg["grid"]["ky"])
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    qle = QuasilinearEvolution(cfg)
+    f0 = np.asarray(initial_vdf(cfg))
+    v = np.asarray(qle.v)
+    n_m = wpe**2 * me**2 / (4.0 * np.pi * e**2)
+    lam = np.sqrt(vte_sq) / wpe
+    if angles is None:
+        i = int(np.argmin(np.abs(kx * lam - k_lambda_d)))
+        modes = [(j, 0) for j in range(i - 6, i + 6)]
+    else:
+        modes = []
+        for kl, ang in angles:
+            kt, a = kl / lam, np.deg2rad(ang)
+            modes.append((int(np.argmin(np.abs(kx - kt * np.cos(a)))), int(np.argmin(np.abs(ky - kt * np.sin(a))))))
+    amp = 1e-11
+    for i, j in modes:
+        phi_k = np.zeros((nx, ny), dtype=complex)
+        phi_k[i, j] = amp * nx * ny
+        c = np.asarray(qle.diffusion_tensor(jnp.asarray(phi_k)))
+        if qle.ndim == 1:
+            heating = n_m / vte_sq * np.sum(c[:, 0] * v**2 * f0) * qle.dv
+        else:
+            vx, vy = np.meshgrid(v, v, indexing="ij")
+            vcv = c[..., 0] * vx**2 + 2.0 * c[..., 2] * vx * vy + c[..., 1] * vy**2
+            heating = n_m / vte_sq * np.sum(vcv * f0) * qle.dv**2
+        k = np.hypot(kx[i], ky[j])
+        v_ph = np.sqrt(wpe**2 + 3.0 * vte_sq * k**2) / k
+        f1 = np.exp(-(v_ph**2) / (2.0 * vte_sq)) / np.sqrt(2.0 * np.pi * vte_sq)
+        exact = n_m * 0.5 * np.pi * (e / me) ** 2 * k * amp**2 * v_ph**2 * f1 / vte_sq
+        assert abs(heating / exact - 1.0) < 0.03, ((i, j), heating / exact)
 
 
 @pytest.mark.parametrize("ny_box", ["0.02um", "1.6um"])

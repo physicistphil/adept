@@ -188,7 +188,8 @@ any new departure here. LPSE source lines marked "unverified" were not checked a
 | Prescribed (undepleted) pump timing | the static pump is computed after the LW step at the step's start time (`ZakharovSolver::evolve` -> `LightSolver::computeFields`), so the IAW and LW read the previous step's pump, and none on the first step | the pump at the step's start `t` is written before the IAW and EPW (or combined-field) consumers | PR #387 review, 5119513 |
 | Quasi-1D resonance-absorption k filter (`ny = 1`) | the zero-width transition makes the filter all-zero and erases the pump every damping update | a sharp passband `abs(k) <= filter_width K_nyq` | PR #378 review, 8b1430b |
 | Resonance absorption with `landau_update > 1` | the increment is computed every `LdUpdate` sub-steps and re-applied on each sub-step in between, rate capped at `1/dt` (`LightSolver.cpp:4670-4674`, `:4820-4831`, `:4682`) | applied on the due sub-steps over the whole interval `T`, rate capped at `1/T`; identical at `landau_update: 1` (LPSE's default) | ae0bfe6 |
-| QLE resonance Jacobian with `thermal_correction` | the cold `1/v` in the diffusion coefficient (`QuasilinearEvolution.cpp:1012-1017`, `:1044`) | the group-velocity Jacobian `1/abs(v - v_g)`, `v_g = 3 vte^2 k_par / w_k` | 078ec22 |
+| QLE diffusion tensor | the continuum form sampled at the velocity nodes, with the cold `1/v` Jacobian (`QuasilinearEvolution.cpp:1000-1050`): modes between the node samples are damped without heating the VDF once the k spacing is finer than a velocity cell's k-space footprint | every mode's resonance `delta(w_k - k . v)` deposited as a cell average (linear weights in 1-D, a bilinear line deposit in 2-D); the Bohm-Gross Jacobian is exact | review 2026-11-16 A9 |
+| QLE Landau rate (`landau_evolution`) | the raw non-relativistic slope functional of `f`, 0 where the phase velocity is off the grid, not thresholded | the slope functional calibrated per mode to the configured fluid rate (form, threshold, multiplier); off-grid modes keep the fluid rate | review 2026-11-16 A9 |
 | QLE Fokker-Planck update | explicit `C d2f + D df` with `D = d_i C_ij` (`QuasilinearEvolution.cpp:332-341`; `qle.includeDerivativeInDiffusionTensor`) | conservative flux form `d_i (C_ij d_j f)` with zero-flux walls; `derivative_in_tensor` accepted and ignored | 078ec22 |
 | QLE Landau-rate gradient | spectral derivative of `f` with the default `qle.solver = spectral` (`QuasilinearEvolution.cpp:1132-1138`) | `f d(ln f)` by central differences, the plain difference where a neighbour sits at the floor | 078ec22, 621b27b |
 | QLE sub-cycling and `qle.solver = implicit` | explicit sub-cycles without a cap (`QuasilinearEvolution.cpp:264-277`); `implicit` is an ADI theta scheme, theta 0.5 in 2-D, 0.67 in 3-D (`ParameterManager.cpp:1063-1067`) | beyond `max_subcycles` a backward-Euler (theta = 1) step solved by CG; the translator maps `implicit` to it, `qle.theta` is not translated | 0a9a3d0 |
@@ -214,9 +215,10 @@ These are not documented as intended and may be unintended.
   (`IawSolver.cpp:932`; the spectral call is commented out, `ZakharovSolver.cpp:2057`). The translator
   writes `max_density_perturbation: 0.9` for every IAW solver, and adept also clips after the spectral
   and explicit steps. It acts only at `abs(dn/n) > 0.9`.
-- **Landau lower threshold with HPE or QLE.** LPSE applies `lw.landauDamping.lowerThreshold` to
-  `LDgammaE * LD_multiplier` in the EPW step (`ZakharovSolver.cpp:2880-2883`); adept applies it only to
-  the static analytic rate, so evolved rates are not thresholded. Only with `landau_lower_threshold > 0`.
+- **Landau lower threshold with HPE.** LPSE applies `lw.landauDamping.lowerThreshold` to
+  `LDgammaE * LD_multiplier` in the EPW step (`ZakharovSolver.cpp:2880-2883`); adept applies it to the
+  static analytic rate and to the QLE's evolved rate, not to the HPE rate. Only with
+  `landau_lower_threshold > 0`.
 - **`hpe.dampingRateMinFraction`** (LPSE floors evolved rates at a fraction of the static rate;
   default 0, off; `LwSolver.cpp:2366-2379`) is not ported and the translator does not report it.
 - **HPE energy-conservation gate.** LPSE re-solves the multiplier only while the averaged particle
