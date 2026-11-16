@@ -769,6 +769,36 @@ def test_magnetic_field_rotates_momentum_without_changing_energy():
     np.testing.assert_allclose(np.arctan2(u2[:, 1], u2[:, 0]), theta, rtol=1e-6)
 
 
+def test_energy_conservation_wave_energy_is_the_total_langmuir_energy():
+    """The wave energy the multiplier balances is the Langmuir wave's total (electrostatic + kinetic)
+    energy for the field the particles feel, Re(E_env e^{-i wp0 t}): twice the cycle-averaged
+    electrostatic energy, i.e. integral |E_env|^2 / (8 pi) dA (erg per cm of depth), as LPSE's
+    getExpectedLwEnergyChange. Computed here from the field itself; rtol 1e-10 (it was 2x)."""
+    from adept._lpse2d_cpp.core.hpe import HybridParticleEvolution
+
+    cfg = _make_cfg({"energy_conservation": True})
+    hpe = HybridParticleEvolution(cfg)
+    d = cfg["units"]["derived"]
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    kx, ky = np.asarray(cfg["grid"]["kx"]), np.asarray(cfg["grid"]["ky"])
+    phi_k = np.zeros((nx, ny), dtype=np.complex128)
+    phi_k[3, 0], phi_k[7, 0] = 1.0e-3, 4.0e-4 * np.exp(0.7j)
+    e_env = np.stack([np.fft.ifft2(-1j * kx[:, None] * phi_k), np.fft.ifft2(-1j * ky[None, :] * phi_k)])
+    c_cgs, me_cgs, e_cgs = 2.99792458e10, 9.10938291e-28, 4.8032068e-10
+    field_to_cgs = d["e_norm"] * me_cgs * c_cgs * d["w0"] * 1.0e12 / e_cgs  # code field -> statV/cm
+    e_env = e_env * field_to_cgs
+    # cycle average of the pushed field's square, over one carrier period
+    phases = np.exp(-1j * np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False))
+    e_phys_sq = np.mean(np.real(e_env[None] * phases[:, None, None, None]) ** 2, axis=0).sum(axis=0)
+    area = cfg["grid"]["dx"] * cfg["grid"]["dy"] * 1.0e-8  # cm^2
+    electrostatic = float(np.sum(e_phys_sq) * area / (8.0 * np.pi))
+    wave = float(hpe.wave_energy_scale * jnp.sum(hpe.k_sq * jnp.abs(jnp.asarray(phi_k)) ** 2))
+    np.testing.assert_allclose(wave, 2.0 * electrostatic, rtol=1e-10)
+    # the large-rate limit of the expected loss is that whole energy
+    gamma_big = jnp.full((nx, ny), 1.0e3 / hpe.dt)
+    np.testing.assert_allclose(float(hpe.expected_wave_loss(1.0, gamma_big, jnp.asarray(phi_k))), wave, rtol=1e-12)
+
+
 def test_energy_conservation_multiplier_tracks_the_particle_gain():
     """Plan 2 N.2: the multiplier solves LPSE's exponential expected-loss form,
     ``W (1 - exp(-2 dt M gamma)) = gain`` on a single mode, i.e. ``M = -ln(1 - gain/W) / (2 dt gamma)``,

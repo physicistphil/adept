@@ -331,7 +331,11 @@ class HybridParticleEvolution:
         self.cone_dir = jnp.asarray(cone_dir / max(np.linalg.norm(cone_dir), 1e-30))
         # energy scales for the energy-conservation multiplier (both in erg per cm of depth):
         # particle energy = sum(gamma - 1) * (N_tail / n_p) m c^2 with N_tail the retained tail
-        # electrons in the box; wave energy from k^2 |phi_k|^2 through the epw_energy normalization
+        # electrons in the box; wave energy from k^2 |phi_k|^2 through the epw_energy normalization.
+        # The particles feel Re(E_env e^{-i wp0 t}), whose cycle-averaged electrostatic energy is
+        # |E_env|^2 / (16 pi); the Langmuir wave's total (electrostatic + kinetic) energy, which
+        # Landau damping removes at 2 gamma, is twice that, |E_env|^2 / (8 pi) -- LPSE's
+        # getExpectedLwEnergyChange (ZakharovSolver.cpp:2975-3004) uses the same
         c_cgs, me_cgs, e_cgs = 2.99792458e10, 9.10938291e-28, 4.8032068e-10
         w0_si = derived["w0"] * 1.0e12
         lambda_um = 2.0 * np.pi * derived["c"] / derived["w0"]
@@ -350,7 +354,6 @@ class HybridParticleEvolution:
             * ly_cm
             * field_unit**2
             / (8.0 * np.pi)
-            * 2.0  # total (electrostatic + kinetic) EPW energy
         )
         self.k_sq = self.kx[:, None] ** 2 + self.ky[None, :] ** 2
         self.angles = jnp.asarray(arrays["angles"])
