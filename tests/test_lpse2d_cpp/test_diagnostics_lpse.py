@@ -66,6 +66,35 @@ def test_poynting_of_a_plane_wave_is_group_velocity_times_intensity(tmp_path):
     assert np.max(np.abs(fields["s1_x"].values)) == 0.0
 
 
+def test_poynting_counts_the_out_of_plane_component(tmp_path):
+    """An s-polarised plane wave (E_z only, three-component state) carries the same flux v_g |E|^2 as a
+    p-polarised one (rtol 2e-2, the centred difference's sin(k dx)/(k dx) at this k as above), and a
+    wave with E_y and E_z carries the sum."""
+    from adept._lpse2d_cpp.helpers import make_field_xarrays
+
+    cfg = _cfg()
+    cfg["save"]["fields"]["poynting"] = True
+    d = cfg["units"]["derived"]
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    k0 = np.asarray(cfg["grid"]["kx"])[6]
+    x = np.asarray(cfg["grid"]["x"])
+    v_g = d["c"] ** 2 * k0 / d["w0"]
+    amp = 2.0e-3
+    for comps, expected in (((2,), amp**2), ((1, 2), 2.0 * amp**2)):
+        e0 = np.zeros((1, nx, ny, 3), dtype=np.complex128)
+        for c in comps:
+            e0[0, :, :, c] = amp * np.exp(1j * k0 * x)[:, None]
+        state = {
+            "epw": np.zeros((1, nx, ny), dtype=np.complex128).view(np.float64),
+            "E0": e0.view(np.float64),
+            "E1": np.zeros((1, nx, ny, 3), dtype=np.complex128).view(np.float64),
+        }
+        out = tmp_path / f"c{len(comps)}"
+        (out / "binary").mkdir(parents=True)
+        _, fields = make_field_xarrays(cfg, np.array([0.0]), state, str(out))
+        np.testing.assert_allclose(fields["s0_x"].values[0, 4:-4, :], v_g * expected, rtol=2e-2)
+
+
 def test_thomson_probe_picks_the_mode_in_its_window():
     cfg = _cfg(thomson=[{"k": [0.5, 0.0], "bandwidth": 0.05}, {"k": [-0.5, 0.0], "bandwidth": 0.05}])
     save_func = cfg["save"]["default"]["func"]

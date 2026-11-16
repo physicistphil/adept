@@ -229,7 +229,7 @@ class BaseLPSE2D(ADEPTModule):
                 field = probe.get("field", "E0")
                 print(f"restart: save.light_spectrum probe on {field} ended before the restart; dropped")
                 continue
-            kept.append({**probe, "tmin": f"{t_first:.12g}ps"})
+            kept.append({**probe, "tmin": ps_string(t_first)})
         if probes:
             self.cfg["save"]["light_spectrum"] = kept
 

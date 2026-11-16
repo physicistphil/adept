@@ -1965,7 +1965,7 @@ def make_field_xarrays(cfg, this_t, state, td):
             dys = float(yax[1] - yax[0]) if len(yax) > 1 else 1.0
             sx = np.zeros(arr.shape[:-1])
             sy = np.zeros(arr.shape[:-1])
-            for comp in range(2):
+            for comp in range(arr.shape[-1]):  # every component: E_z carries the s-polarised flux
                 e = arr[..., comp]
                 sx += np.imag(np.conj(e) * np.gradient(e, dxs, axis=1))
                 if arr.shape[2] > 1:
