@@ -246,7 +246,7 @@ def test_transverse_profile_kap_and_pulse_file(tmp_path):
     light = SpectralCoupledLight(cfg)
     y = np.asarray(cfg["grid"]["y"])
     expected = np.exp(-(((y - 1.0) ** 2 / (2.0 * 2.0**2)) ** 2.0))
-    np.testing.assert_allclose(np.asarray(light.beam_envelope_y), expected, rtol=1e-12)
+    np.testing.assert_allclose(np.asarray(light.beam_envelope_y)[0], expected, rtol=1e-12)  # normal incidence
     _, args = UniformDriver(cfg)({}, {"drivers": {}})
     pa = args["drivers"]["E0"]
     # the pulse table is a power factor: 0.25 scales the source amplitude by sqrt(0.25) = 0.5

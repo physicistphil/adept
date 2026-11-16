@@ -39,7 +39,7 @@ import numpy as np
 from jax import Array, lax
 from jax import numpy as jnp
 
-from adept._lpse2d_cpp.core.light import CoupledLight, super_gaussian_y
+from adept._lpse2d_cpp.core.light import CoupledLight, beam_envelopes_y
 from adept._lpse2d_cpp.core.raman import RamanLight, transverse_part
 from adept._lpse2d_cpp.core.timeline import as_linear
 from adept._lpse2d_cpp.core.vector import fft2c, ifft2c, split_k, with_components
@@ -245,16 +245,22 @@ class SmoothPumpInjector:
             np.atleast_1d(pump.get("beam_polarization", [pump.get("polarization", 0.0)])), dtype=jnp.float64
         )
         self.y_arr = jnp.asarray(cfg["grid"]["y"])
-        # transverse super-Gaussian of the injected beams (LPSE laser.N.width / sgOrder / offset)
+        # transverse super-Gaussian of each injected beam across its own axis (LPSE laser.N.width /
+        # sgOrder / offset), (n_beams, ny)
         width = float(pump.get("beam_width", 0.0) or 0.0)
         if cfg["grid"]["ny"] > 1:
             self.beam_envelope_y = jnp.asarray(
-                super_gaussian_y(
-                    cfg["grid"]["y"], width, float(pump.get("beam_sg_order", 4.0)), float(pump.get("beam_offset", 0.0))
+                beam_envelopes_y(
+                    cfg["grid"]["y"],
+                    width,
+                    float(pump.get("beam_sg_order", 4.0)),
+                    float(pump.get("beam_offset", 0.0)),
+                    ky_beams,
+                    k0_beams,
                 )
             )
         else:
-            self.beam_envelope_y = jnp.ones(cfg["grid"]["ny"])
+            self.beam_envelope_y = jnp.ones((angles.size, cfg["grid"]["ny"]))
         # Kubo-Anderson bandwidth: piecewise-constant random phase with correlation time 2 pi / (dW)
         self.kap_bandwidth = float(pump.get("kap_bandwidth", 0.0) or 0.0)
         self.kap_seed = int(pump.get("kap_seed", 0) or 0)
@@ -276,7 +282,6 @@ class SmoothPumpInjector:
         intensities = pump_args["intensities"]  # (nc, ny)
         phases = pump_args["phases"]  # (nc, ny)
         amp = self.E0_source * jnp.sqrt(intensities) * time_factor  # (nc, ny)
-        amp = amp * self.beam_envelope_y[None, :]
         color_phase = jnp.exp(-1j * self.w0 * delta_omega[:, None] * t + 1j * phases)  # (nc, ny)
         total = jnp.zeros((self.x.shape[0], self.y_arr.shape[0], 3), dtype=jnp.complex128)
         for b in range(int(self.ky_beams.shape[0])):
@@ -288,7 +293,13 @@ class SmoothPumpInjector:
             kx = sign * jnp.sqrt(k0**2 - ky_b**2)  # (nc,) longitudinal wavenumber of each color, signed
             v_gx = self.c**2 * jnp.abs(kx) / self.w0  # flux through the injector plane: the x group velocity
             beam_phase = self.beam_phase[b] - self.w0 * dw_b * t + self.kap_phase(t, b)
-            amp_b = amp / (1.0 - n_src) ** 0.25 * jnp.sqrt(self.beam_fraction[b]) * jnp.exp(1j * beam_phase)
+            amp_b = (
+                amp
+                * self.beam_envelope_y[b][None, :]
+                / (1.0 - n_src) ** 0.25
+                * jnp.sqrt(self.beam_fraction[b])
+                * jnp.exp(1j * beam_phase)
+            )
             carrier = jnp.exp(1j * kx[:, None] * (self.x[None, :] - self.x[i_inject]))  # (nc, nx)
             source = (amp_b * v_gx[:, None] * color_phase)[:, None, :] * (carrier * profile[None, :])[:, :, None]
             source = jnp.sum(source, axis=0) * jnp.exp(1j * ky_b * self.y_arr)[None, :]  # (nx, ny)

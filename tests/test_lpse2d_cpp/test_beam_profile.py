@@ -19,6 +19,15 @@ def _lpse_super_gaussian(y, width, order, offset):
     return np.exp(-(np.abs((y - offset) / width) ** order))
 
 
+def _lpse_beam_weight(y, width, order, offset, kx, ky):
+    """SchrodingerSolver3.cpp:2375-2392: R = (x, y) - offset with the plane-normal component zeroed,
+    rPrime = R - Kdir (Kdir . R), weight = superGaussian(|rPrime|)."""
+    r = np.stack([np.zeros_like(y), y - offset], axis=-1)
+    kdir = np.array([kx, ky]) / np.hypot(kx, ky)
+    r_prime = r - kdir[None, :] * (r @ kdir)[:, None]
+    return _lpse_super_gaussian(np.linalg.norm(r_prime, axis=-1), width, order, 0.0)
+
+
 def _finish(cfg):
     from adept._lpse2d_cpp.helpers import (
         get_density_profile,
@@ -76,8 +85,47 @@ def test_injected_beam_profile_is_lpse_super_gaussian(solver, order):
     cfg = _cfg(solver, **e0)
     light = (SpectralCoupledLight if solver == "spectral" else CoupledLight)(cfg)
     y = np.asarray(cfg["grid"]["y"])
-    want = _lpse_super_gaussian(y, w_lpse, 4.0 if order is None else order, offset)
-    np.testing.assert_allclose(np.asarray(light.beam_envelope_y), want, rtol=1e-12, atol=1e-300)
+    ky = float(light.ky_beams[0])
+    k0 = light.w0 / light.c * np.sqrt(1.0 - light.beam_n_src[0])
+    want = _lpse_beam_weight(y, w_lpse, 4.0 if order is None else order, offset, np.sqrt(k0**2 - ky**2), ky)
+    np.testing.assert_allclose(np.asarray(light.beam_envelope_y)[0], want, rtol=1e-12, atol=1e-300)
+
+
+@pytest.mark.parametrize("solver", ["spectral", "fd"])
+@pytest.mark.parametrize("snap", [True, False])
+def test_oblique_beam_profile_is_across_the_beam_axis(solver, snap):
+    """Every beam's profile is LPSE's weight at rPrime, the distance from the beam axis, i.e. at
+    |y - y0| cos(theta) on the injection plane: an oblique beam keeps its width across its axis and
+    its footprint widens by 1 / cos(theta) (the old profile in y alone made it cos(theta) narrower
+    and cos(theta) less powerful: -6 % at 20 deg, -29 % at 45 deg). rtol 1e-12."""
+    from adept._lpse2d_cpp.core.light import CoupledLight
+    from adept._lpse2d_cpp.core.spectral_light import SpectralCoupledLight
+
+    w_lpse, offset, order = 2.0, 0.5, 4.0
+    cfg = _cfg(
+        solver,
+        beam_width=f"{w_lpse / np.sqrt(2.0)}um",
+        beam_offset=f"{offset}um",
+        beam_sg_order=order,
+        beams=[{"intensity": 0.5, "angle": 20.0}, {"intensity": 0.5, "angle": -45.0}],
+    )
+    cfg["terms"]["light"]["snap_beam_ky"] = snap
+    light = (SpectralCoupledLight if solver == "spectral" else CoupledLight)(cfg)
+    y = np.asarray(cfg["grid"]["y"])
+    env = np.asarray(light.beam_envelope_y)
+    assert env.shape == (2, y.size)
+    for b, angle in enumerate((20.0, -45.0)):
+        ky = float(light.ky_beams[b])
+        k0 = light.w0 / light.c * np.sqrt(1.0 - light.beam_n_src[b])
+        if not snap:
+            np.testing.assert_allclose(ky, k0 * np.sin(np.deg2rad(angle)), rtol=1e-12)
+        want = _lpse_beam_weight(y, w_lpse, order, offset, np.sqrt(k0**2 - ky**2), ky)
+        np.testing.assert_allclose(env[b], want, rtol=1e-12, atol=1e-300)
+    # the 45 deg footprint is sqrt(2) wider than the 0 deg one: its half-maximum points
+    half = env[1] >= 0.5
+    width_45 = (y[half].max() - y[half].min()) if half.any() else 0.0
+    w_half_0 = 2.0 * w_lpse * np.log(2.0) ** (1.0 / order)
+    assert abs(width_45 / w_half_0 - 1.0 / np.cos(np.arcsin(float(light.ky_beams[1]) / k0))) < 0.1
 
 
 def test_translator_beam_profile_keys_and_defaults():

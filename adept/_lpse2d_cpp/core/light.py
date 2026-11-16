@@ -10,15 +10,27 @@ from adept._lpse2d_cpp.core.raman import RamanLight, light_source_mask, transver
 from adept._lpse2d_cpp.core.timeline import as_linear
 
 
-def super_gaussian_y(y, width: float, order: float, offset: float) -> np.ndarray:
-    """LPSE's transverse beam profile (``SchrodingerSolver3::superGaussian``) across y:
-    ``exp(-(|y - offset| / W)^order)`` with ``W = sqrt(2) width`` (``beam_width`` is the Gaussian
-    standard deviation, the translator's ``W / sqrt(2)``); 1 everywhere when the width or the order
-    is 0, LPSE's periodic-injection case."""
+def super_gaussian_y(y, width: float, order: float, offset: float, cos_theta: float = 1.0) -> np.ndarray:
+    """LPSE's transverse beam profile (``SchrodingerSolver3::superGaussian``) on an x injection plane:
+    ``exp(-(|y - offset| cos(theta) / W)^order)`` with ``W = sqrt(2) width`` (``beam_width`` is the
+    Gaussian standard deviation across the beam axis, the translator's ``W / sqrt(2)``); 1 everywhere
+    when the width or the order is 0, LPSE's periodic-injection case.
+
+    LPSE evaluates the profile at ``rPrime = R - Kdir (Kdir . R)`` with the plane-normal component of
+    ``R`` zeroed (``SchrodingerSolver3.cpp:2385-2392``, ``:2760-2767``), i.e. at the distance from the
+    beam axis, ``|y - offset| cos(theta)`` for a beam at ``theta`` to x: the beam is ``W`` wide across
+    its axis and its footprint on the plane ``W / cos(theta)``."""
     y = np.asarray(y, dtype=np.float64)
     if width <= 0.0 or order == 0.0:
         return np.ones_like(y)
-    return np.exp(-((np.abs(y - offset) / (np.sqrt(2.0) * width)) ** order))
+    return np.exp(-((np.abs(y - offset) * cos_theta / (np.sqrt(2.0) * width)) ** order))
+
+
+def beam_envelopes_y(y, width: float, order: float, offset: float, ky_beams, k0_beams) -> np.ndarray:
+    """``super_gaussian_y`` of every beam, ``(n_beams, ny)``, across the axis of its injected wavevector
+    (``cos(theta) = sqrt(1 - (ky / k0)^2)`` at the plane, with the snapped ``ky`` when it is snapped)."""
+    cos_beams = np.sqrt(1.0 - (np.asarray(ky_beams, dtype=np.float64) / np.asarray(k0_beams, dtype=np.float64)) ** 2)
+    return np.stack([super_gaussian_y(y, width, order, offset, float(c)) for c in np.atleast_1d(cos_beams)])
 
 
 class CoupledLight(RamanLight):
@@ -313,17 +325,20 @@ class CoupledLight(RamanLight):
             self.beam_polarization = np.atleast_1d(
                 np.asarray(pump.get("beam_polarization", [pump.get("polarization", 0.0)]), dtype=np.float64)
             )
+            # (n_beams, ny): each beam's profile across its own axis
             if self.ny > 1:
                 self.beam_envelope_y = jnp.asarray(
-                    super_gaussian_y(
+                    beam_envelopes_y(
                         y_np,
                         self.beam_width,
                         float(pump.get("beam_sg_order", 4.0)),
                         float(pump.get("beam_offset", 0.0)),
+                        ky_beams,
+                        k0_beams,
                     )
                 )
             else:
-                self.beam_envelope_y = jnp.ones(self.ny)
+                self.beam_envelope_y = jnp.ones((angles.size, self.ny))
             m = self.fd_order // 2
             # the commutator is non-zero on the stencil's rows about each plane only: offsets
             # -m+1 .. m from the plane for either direction -- the mask edge lies between rows i
@@ -442,7 +457,6 @@ class CoupledLight(RamanLight):
         scalar factors applied in ``pump_rhs``, so this is evaluated once per EPW step."""
         delta_omega = pump_args["delta_omega"]  # (nc,)
         amp_y = jnp.sqrt(pump_args["intensities"]) * jnp.exp(1j * pump_args["phases"])  # (nc, ny)
-        amp_y = amp_y * self.beam_envelope_y[None, :]
         x = self.x[None, :, None]
         y = self.y[None, None, :]
         patterns = []
@@ -452,7 +466,7 @@ class CoupledLight(RamanLight):
             k0 = self.w0 / self.c * jnp.sqrt((1.0 + delta_omega + self.beam_delta_omega[b]) ** 2 - n_src)  # (nc,)
             kx = sign * jnp.sqrt(k0**2 - ky_b**2)  # (nc,)
             carrier = jnp.exp(1j * (kx[:, None, None] * (x - self.x[i_inject]) + ky_b * y))  # (nc, nx, ny)
-            v = carrier * amp_y[:, None, :] / (1.0 - n_src) ** 0.25
+            v = carrier * (amp_y * self.beam_envelope_y[b][None, :])[:, None, :] / (1.0 - n_src) ** 0.25
             k_mag = jnp.sqrt(kx[0] ** 2 + ky_b**2)
             cos_psi, sin_psi = np.cos(self.beam_polarization[b]), np.sin(self.beam_polarization[b])
             # LPSE rotateBeam: cos(psi) along the in-plane transverse direction of the first
