@@ -279,7 +279,7 @@ The deck translator reports decks it cannot represent exactly: one light solver,
 `interpolate_sources` flag and beam profile for both light classes; one `abc.lambda`, one `Labc` per
 field and one anti-aliasing mask; one light absorber type (`abc.type`); PPM as the only FD-IAW advection scheme; no Raman resonance
 absorption, per-beam KAP bandwidths, Raman pulse shape or `raman.sourceTerm.lw = false`; no y-face
-beams or beams at 90 degrees; one Raman seed (`raman.1`, along -x from x-max, order-4 profile about `y = 0`, no phase or KAP bandwidth); LPSE's abbreviated beam format (`laser.intensity = [...]`) raises. Not translated and not reported: `laser.spectral.injectorWidth`,
+beams or beams at 90 degrees; one Raman seed (`raman.1`, along -x from x-max, order-4 profile about `y = 0`, no phase or KAP bandwidth); LPSE's abbreviated beam format (`laser.intensity = [...]`) raises. LPSE's per-group flux normalisation of the pump beams (`laser.isNormalizeSources` for the evolved pump, always for the static one) is not ported; the translator reports decks with beams sharing a group (evolved) or a group's grid wavevector (static). Not translated and not reported: `laser.spectral.injectorWidth`,
 `qle.theta`, `hpe.dampingRateMinFraction`.
 
 ### adept-only options

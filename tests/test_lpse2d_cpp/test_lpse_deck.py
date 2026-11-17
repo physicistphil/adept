@@ -807,3 +807,35 @@ def test_translator_fd_damping_enable_false_skips_the_kspace_step(tmp_path):
     )
     assert cfg["terms"]["iaw"]["damping"]["landau"] == 0.1
     assert any("no effect" in n for n in report["notes"])
+
+
+def _two_beams(first: str, second: str, extra: str = "") -> str:
+    return (
+        f"laser.nBeams = 2;\nlaser.2.intensity = 1e15;\nlaser.1.direction = {first};\nlaser.2.direction = {second};\n"
+        + extra
+    )
+
+
+def test_translator_reports_lpse_group_flux_normalization(tmp_path):
+    """Review 2026-11-16 B16: LPSE rescales each evolved-pump injector group (laser.N.group per side, else beams
+    sharing side, frequency shift and offset; LightSolver::sortBeamsDynamic) to the incoherent sum of its beams'
+    fluxes at t = 0 when laser.isNormalizeSources (default true; SchrodingerSolver3::normalizeLightSourcesDynamic),
+    and each static group (laser.N.group, else equal frequency shift; sortBeamsStatic) whose beams share a grid
+    wavevector to the sum of their energies (normalizeLightSourcesStatic_fft, always). adept does neither; the
+    translator now reports the decks where the two can differ and stays quiet otherwise."""
+
+    def flagged(extra):
+        _, report = _translate_minimal(tmp_path, extra)
+        return [u for u in report["unsupported"] if "isNormalizeSources" in u or "grid wavevector" in u]
+
+    evolved = "laser.solver = fd;\n"
+    assert flagged(evolved + _two_beams("1 0.2 0", "1 -0.2 0"))  # one auto group: same side, shift, offset
+    assert not flagged(evolved + _two_beams("1 0.2 0", "1 -0.2 0", "laser.isNormalizeSources = false;\n"))
+    assert not flagged(evolved + _two_beams("1 0.2 0", "1 -0.2 0", "laser.1.group = 0;\nlaser.2.group = 1;\n"))
+    assert not flagged(evolved + _two_beams("1 0.2 0", "1 -0.2 0", "laser.2.frequencyShift = 0.001;\n"))
+    assert not flagged(evolved + _two_beams("1 0.2 0", "1 -0.2 0", "laser.2.evolution.offset = 0 2 0;\n"))
+    # static pump: the same wavevector on the grid (dk = 2 pi / (200 h) along x, 2 pi / (100 h) along y)
+    assert flagged(_two_beams("1 0 0", "1 0.001 0"))
+    assert not flagged(_two_beams("1 0.3 0", "1 -0.3 0"))
+    assert not flagged(_two_beams("1 0 0", "1 0 0", "laser.1.group = 0;\nlaser.2.group = 1;\n"))
+    assert not flagged(_two_beams("1 0 0", "1 0 0", "laser.2.frequencyShift = 0.001;\n"))

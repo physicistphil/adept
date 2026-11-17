@@ -832,6 +832,8 @@ def translate_parms(
             }
         )
     polarization_deg = beams[0]["polarization"] if beams else 0.0
+    if len(beams) > 1:
+        _report_lpse_flux_normalization(g, report, beams, laser_evolves, dx, nodes, n_env, wavelength_um)
     beam_extras = {}
 
     def beam_profile(b):
@@ -1407,6 +1409,69 @@ def translate_parms(
 
 
 # ---------------------------------------------------------------- outputs --
+
+
+def _report_lpse_flux_normalization(g, report, beams, evolved, h, nodes, n_env, wavelength_um) -> None:
+    """LPSE rescales the pump beams of each injector group so that the group's injected energy equals the sum
+    of its beams' intensities, removing their interference; adept injects every beam at its own intensity.
+    Reported where the two can differ.
+
+    Evolved pump (``laser.isNormalizeSources``, default true; ``SchrodingerSolver3::normalizeLightSourcesDynamic``):
+    the group's coherent flux over the injector plane at t = 0 is scaled to the incoherent one, per field
+    component; groups are ``laser.N.group`` per side, else beams sharing the side, frequency shift and offset
+    (``LightSolver::sortBeamsDynamic``). Any group of two or more beams is reported (the factor differs from 1
+    where their fields overlap on the plane: finite-width beams, or flat beams on one transverse wavenumber).
+
+    Static pump (always; ``LightSolver::normalizeLightSourcesStatic_fft``): each group's k-space energy is
+    scaled to the sum of its beams' energies, which changes only beams of one group landing on the same grid
+    wavevector ``round(k_beam / dk)`` (``dk = 2 pi / (N h)`` per axis, ``2 pi / h`` on a flat one,
+    ParameterManager.cpp:1297),
+    ``k_beam = (w0/c) sqrt((1 + dw)^2 - n_env)`` along the beam's 3-D direction; groups are
+    ``laser.N.group``, else each beam alone with KAP bandwidth, else beams sharing the frequency shift
+    (``LightSolver::sortBeamsStatic``)."""
+    n = len(beams)
+    explicit = [g(f"laser.{b}.group") for b in range(1, n + 1)]
+    groups: dict = {}
+    for i, beam in enumerate(beams):
+        b = i + 1
+        if evolved:
+            side = str(g(f"laser.{b}.evolution.source", "min.x")).lower()  # LPSE's default face (sourceTag 1)
+            if explicit[i] is not None:
+                key = (side, "group", int(float(explicit[i])))
+            else:
+                offset = tuple((list(_floats(g(f"laser.{b}.evolution.offset", "0 0 0"))) + [0.0, 0.0, 0.0])[:3])
+                key = (side, beam["delta_omega"], offset)
+        elif explicit[0] is not None:
+            key = int(float(explicit[i] if explicit[i] is not None else -1))
+        elif any(float(g(f"laser.{c}.bandwidth.KAP.frequency", "0")) > 0.0 for c in range(1, n + 1)):
+            key = b
+        else:
+            key = beam["delta_omega"]
+        groups.setdefault(key, []).append(b)
+    shared = [members for members in groups.values() if len(members) > 1]
+    if evolved:
+        if shared and _bool(g("laser.isNormalizeSources"), True):
+            report["unsupported"].append(
+                f"laser.isNormalizeSources (LPSE default true): beams {shared} share injector groups, whose injected "
+                "flux LPSE rescales to the sum of their intensities at t = 0; adept injects each beam at its own "
+                "intensity (the two differ where the beams' fields overlap on the injector plane)"
+            )
+        return
+    k0 = 2.0 * np.pi / wavelength_um
+    dk = 2.0 * np.pi / (np.asarray((list(nodes) + [1, 1, 1])[:3], dtype=float) * h)
+    for members in shared:
+        indices = []
+        for b in members:
+            direction = np.asarray((list(_floats(g(f"laser.{b}.direction", "1 0 0"))) + [0.0, 0.0, 0.0])[:3])
+            direction = direction / np.linalg.norm(direction)
+            k = k0 * np.sqrt((1.0 + beams[b - 1]["delta_omega"]) ** 2 - n_env) * direction
+            indices.append(tuple(int(v) for v in np.round(k / dk)))
+        if len(set(indices)) < len(indices):
+            report["unsupported"].append(
+                f"static pump beams {members} (one LPSE group) share a grid wavevector: LPSE rescales the group's "
+                "energy to the sum of their intensities (normalizeLightSourcesStatic_fft); adept keeps their "
+                "interference"
+            )
 
 
 def _light_spectrum_probes(parms: dict, g, report: dict, laser_evolves: bool, raman_on: bool) -> list[dict]:
