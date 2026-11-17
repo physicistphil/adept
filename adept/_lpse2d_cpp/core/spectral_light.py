@@ -39,7 +39,12 @@ import numpy as np
 from jax import Array, lax
 from jax import numpy as jnp
 
-from adept._lpse2d_cpp.core.light import CoupledLight, beam_envelopes_y
+from adept._lpse2d_cpp.core.light import (
+    CoupledLight,
+    beam_envelopes_y,
+    beam_transverse_wavenumbers,
+    beam_wavenumbers,
+)
 from adept._lpse2d_cpp.core.raman import RamanLight, transverse_part
 from adept._lpse2d_cpp.core.timeline import as_linear
 from adept._lpse2d_cpp.core.vector import fft2c, ifft2c, split_k, with_components
@@ -188,7 +193,8 @@ class SpectralRamanLight(RamanLight):
 
 class SmoothPumpInjector:
     """LPSE's smooth pump injector for an evolved pump: oblique, multiple and leftward beams
-    (transverse wavenumber snapped to the y grid unless ``terms.light.snap_beam_ky: false``),
+    (transverse wavenumber snapped to the y grid for beams without a transverse profile, as LPSE's
+    periodic injector, unless ``terms.light.snap_beam_ky: false``),
     fractions, phases, frequency offsets, per-beam polarization, the transverse super-Gaussian
     profile and Kubo-Anderson bandwidth, summed over colors, with the pump's time factor
     (envelope, turn-on, pulse shape). Shared by ``SpectralCoupledLight`` and the combined solver
@@ -213,24 +219,25 @@ class SmoothPumpInjector:
         self.beam_i_inject = [self.i0_max if left else self.i0 for left in leftward]
         self.beam_n_src = [self.n_src_max if left else self.n_src for left in leftward]
         k0_inject = self.w0 / self.c * np.sqrt(1.0 - self.n_src)
-        # in-plane angle of incidence (drivers.E0.angle): the transverse wavenumber is snapped
-        # to the periodic y grid (terms.light.snap_beam_ky, default), kx follows from the local
-        # dispersion per color, and the field is polarised perpendicular to k (LPSE beam
-        # direction / polarization 0). With snap_beam_ky false the injector carries the exact
-        # k0 sin(angle) as LPSE's spectral injector does: on a box whose width does not fit
-        # that wavelength the source has a phase kink at the periodic seam whose sidebands add
-        # up to an intensity hot spot there (test_010: +45 %, plan-2 N.1) -- kept as an option
-        # to reproduce such a reference run, not as a default.
-        dky = 2.0 * np.pi / (cfg["grid"]["ny"] * cfg["grid"]["dy"])
+        # in-plane angle of incidence (drivers.E0.angle): ky = k_b sin(angle) at the beam's own
+        # frequency, snapped to the periodic y grid for a beam without a transverse profile (LPSE's
+        # periodic injector; terms.light.snap_beam_ky: false leaves it exact), kx follows from the
+        # local dispersion per color, and the field is polarised perpendicular to k (LPSE beam
+        # direction / polarization 0). An unsnapped uniform beam on a box whose width does not fit
+        # its transverse wavelength has a phase kink at the periodic seam whose sidebands add up to
+        # an intensity hot spot there (test_010: +45 %, plan-2 N.1).
         angles = np.atleast_1d(np.asarray(pump.get("beam_angle", [pump.get("angle", 0.0)]), dtype=np.float64))
-        snap = bool(cfg["terms"].get("light", {}).get("snap_beam_ky", True))
-        k0_beams = self.w0 / self.c * np.sqrt(1.0 - np.asarray(self.beam_n_src, dtype=np.float64))
-        if cfg["grid"]["ny"] > 1:
-            ky_beams = k0_beams * np.sin(angles)
-            if snap:
-                ky_beams = np.round(ky_beams / dky) * dky
-        else:
-            ky_beams = np.zeros_like(angles)
+        beam_dw = np.atleast_1d(np.asarray(pump.get("beam_delta_omega", [0.0]), dtype=np.float64))
+        k0_beams = beam_wavenumbers(self.w0, self.c, self.beam_n_src, beam_dw)
+        ky_beams = beam_transverse_wavenumbers(
+            k0_beams,
+            angles,
+            2.0 * np.pi / (cfg["grid"]["ny"] * cfg["grid"]["dy"]),
+            cfg["grid"]["ny"],
+            bool(cfg["terms"].get("light", {}).get("snap_beam_ky", True)),
+            float(pump.get("beam_width", 0.0) or 0.0),
+            float(pump.get("beam_sg_order", 4.0)),
+        )
         if np.any(np.abs(ky_beams) >= k0_beams):
             raise ValueError(
                 f"drivers.E0 beam angles {np.rad2deg(angles)} deg cannot be launched at densities {self.beam_n_src}"

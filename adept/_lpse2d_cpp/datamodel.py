@@ -122,8 +122,8 @@ class E0DriverModel(BaseModel):
     # (LPSE laser.static.useSpatiallyVaryingFieldSwelling; the MATLAB prototype)
     swelling: Literal["constant", "local"] = "constant"
     # in-plane angle of incidence from +x in degrees (LPSE laser.N.direction): the static pump
-    # is the grid mode nearest to k0 (cos a, sin a); the spectral injector launches at the
-    # y-snapped transverse wavenumber. Not with speckle or the FD injector.
+    # is the grid mode nearest to k0 (cos a, sin a); the spectral injector launches at k_b sin a,
+    # y-snapped for a beam without a transverse profile (snap_beam_ky). Not with speckle or the FD injector.
     # |angle| > 90 is a leftward beam (LPSE laser.N.direction with a negative x): the injectors
     # launch it from the x-max face at xmax - offset (plan 2 L.4a); +-90 (a y face) is not supported
     angle: float = Field(default=0.0, gt=-180.0, le=180.0)
@@ -388,8 +388,9 @@ class LightModel(BaseModel):
     # the FD scheme itself unstable (non-finite at 1.31 ps with the EPW still at its noise
     # floor, against 3.93 ps unprojected) -- the plan-2 run session, MLflow 618d7666
     transverse_fields: bool = False
-    # spectral injector: snap an oblique beam's k_y to the periodic y grid (default) or launch
-    # the exact k0 sin(angle) as LPSE does (a non-commensurate box then carries a seam hot spot)
+    # evolved-pump injectors: snap the k_y of a beam without a transverse profile to the periodic y
+    # grid, as LPSE's periodic injector (default), or launch the exact k_b sin(angle) (a
+    # non-commensurate box then carries a seam hot spot); a profiled beam is never snapped
     snap_beam_ky: bool = True
     # LPSE suppressSourcesInAbsorbingRegions (default false there) / suppressSourcesAtInjectors
     # (default true there; false here so existing runs are unchanged -- the deck translator

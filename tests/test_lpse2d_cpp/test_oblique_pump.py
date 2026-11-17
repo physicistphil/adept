@@ -320,11 +320,12 @@ def test_translator_maps_multi_beam_decks():
 
 
 def test_exact_beam_ky_reproduces_the_seam_hot_spot():
-    """``terms.light.snap_beam_ky: false`` launches the exact ``k0 sin(angle)`` (LPSE's spectral
-    injector). On a box whose width does not hold an integer number of transverse wavelengths
-    the source has a phase kink at the periodic seam, the injected pump spreads into ky
-    sidebands and |E0|^2 acquires a ripple peaking at the seam; snapped (default) it is one ky
-    row and uniform in y (plan-2 N.1: this ripple is what set the test_010 reference's growth)."""
+    """``terms.light.snap_beam_ky: false`` launches a uniform beam at the exact ``k0 sin(angle)``
+    (LPSE snaps it, ``adjustForPeriodicInjector``; the option reproduces an unsnapped launch). On
+    a box whose width does not hold an integer number of transverse wavelengths the source has a
+    phase kink at the periodic seam, the injected pump spreads into ky sidebands and |E0|^2
+    acquires a ripple peaking at the seam; snapped (default) it is one ky row and uniform in y
+    (plan-2 N.1: this ripple is what set the test_010 reference's growth)."""
     from adept._lpse2d_cpp.core.spectral_light import SpectralCoupledLight
     from adept._lpse2d_cpp.modules.driver import UniformDriver
 

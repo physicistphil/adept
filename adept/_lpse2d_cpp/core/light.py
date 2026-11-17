@@ -33,6 +33,35 @@ def beam_envelopes_y(y, width: float, order: float, offset: float, ky_beams, k0_
     return np.stack([super_gaussian_y(y, width, order, offset, float(c)) for c in np.atleast_1d(cos_beams)])
 
 
+def beam_wavenumbers(w0: float, c: float, n_src, delta_omega) -> np.ndarray:
+    """Each beam's wavenumber at its injector plane, ``(w0/c) sqrt((1 + dw_b)^2 - n_src_b)``, at its own
+    frequency ``w0 (1 + dw_b)`` (``drivers.E0.beams[].delta_omega``) -- the direction of ``ky = k sin(angle)``
+    is then the beam's angle at its own frequency. LPSE's ``Ko_ijk`` is ``(Wo/C) sqrt(1 - n/(1 + dw_b)^2)``
+    (``SchrodingerSolver3.cpp:2363-2366``), smaller by ``1 / (1 + dw_b)``: see Departures from LPSE."""
+    n_src = np.asarray(n_src, dtype=np.float64)
+    dw = np.broadcast_to(np.asarray(delta_omega, dtype=np.float64), n_src.shape)
+    return w0 / c * np.sqrt((1.0 + dw) ** 2 - n_src)
+
+
+def beam_transverse_wavenumbers(k0_beams, angles, dky: float, ny: int, snap: bool, width: float, order: float):
+    """``ky = k0_b sin(angle_b)`` per beam, snapped to the periodic y grid (nearest multiple of ``dky``)
+    for a beam without a transverse profile only -- LPSE's ``isPeriodicInjector = (beamWidth == 0 ||
+    sgOrder == 0) && |Kdir[iDim]| < 1`` (``SchrodingerSolver3.cpp:2369``, ``:2745``, ``:4104``; snapped by
+    ``adjustForPeriodicInjector``, ``:4451-4471``): a uniform beam must be periodic in y to be one grid mode,
+    a profiled beam keeps its exact direction. ``snap: false`` (``terms.light.snap_beam_ky``) leaves the
+    uniform beams unsnapped too. Zero on a quasi-1D grid."""
+    angles = np.asarray(angles, dtype=np.float64)
+    if ny <= 1:
+        return np.zeros_like(angles)
+    sin_a = np.sin(angles)
+    sin_a = np.where(np.abs(sin_a) < 1e-12, 0.0, sin_a)  # an axial beam (0 or 180 deg) has ky = 0 exactly
+    ky = np.asarray(k0_beams, dtype=np.float64) * sin_a
+    periodic = width <= 0.0 or order == 0.0
+    if snap and periodic:
+        ky = np.round(ky / dky) * dky
+    return ky
+
+
 class CoupledLight(RamanLight):
     """
     Evolves the pump E0 and, when enabled, the Raman scattered light E1.
@@ -311,12 +340,17 @@ class CoupledLight(RamanLight):
             self.beam_n_src = [float(background_density[i, 0]) for i in self.beam_i_inject]
             if any(n >= 1.0 for n in self.beam_n_src):
                 raise ValueError("a pump injector plane sits at or above the critical density")
-            k0_beams = self.w0 / self.c * np.sqrt(1.0 - np.asarray(self.beam_n_src))
-            dky = 2.0 * np.pi / (self.ny * self.dy)
-            snap = bool(light_cfg.get("snap_beam_ky", True))
-            ky_beams = k0_beams * np.sin(angles) if self.ny > 1 else np.zeros_like(angles)
-            if snap and self.ny > 1:
-                ky_beams = np.round(ky_beams / dky) * dky
+            beam_dw = np.atleast_1d(np.asarray(pump.get("beam_delta_omega", [0.0]), dtype=np.float64))
+            k0_beams = beam_wavenumbers(self.w0, self.c, self.beam_n_src, beam_dw)
+            ky_beams = beam_transverse_wavenumbers(
+                k0_beams,
+                angles,
+                2.0 * np.pi / (self.ny * self.dy),
+                self.ny,
+                bool(light_cfg.get("snap_beam_ky", True)),
+                self.beam_width,
+                float(pump.get("beam_sg_order", 4.0)),
+            )
             # every colour of every beam must have kx^2 = k0(dw)^2 - ky^2 > 0 at its plane
             dw_min = float(np.min(np.atleast_1d(pump.get("beam_delta_omega", [0.0])))) - float(
                 cfg["drivers"]["E0"].get("delta_omega_max", 0.0) or 0.0
