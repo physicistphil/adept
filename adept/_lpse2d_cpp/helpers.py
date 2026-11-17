@@ -2546,7 +2546,8 @@ def prescribed_pump_x_flux(cfg: dict, E0, swelling):
     the vacuum intensity it represents, both faces' beams counted positive: the swelling factor is divided
     out (``laser.Light``'s, where it is non-zero), and each Fourier mode of the box contributes
     ``c |E_k|^2 |k_x| / |k|``. Exact for the prescribed grid modes; it follows the beams' angles and
-    fractions, the envelope, the pulse shape and a speckle profile, whatever their normalisation."""
+    fractions, the envelope, the pulse shape and a speckle profile, whatever their normalisation. With
+    ``swelling: local`` the cells from 0.9999 n_c, where the pump is zero, are left out of the mean."""
     derived, grid = cfg["units"]["derived"], cfg["grid"]
     kx = np.asarray(grid["kx"], dtype=np.float64)[:, None]
     ky = np.asarray(grid["ky"], dtype=np.float64)[None, :]
@@ -2555,7 +2556,10 @@ def prescribed_pump_x_flux(cfg: dict, E0, swelling):
     vacuum = jnp.where(swelling > 0.0, E0 / jnp.where(swelling > 0.0, swelling, 1.0), 0.0)
     power = jnp.sum(jnp.abs(jnp.fft.fft2(vacuum, axes=(0, 1))) ** 2, axis=-1)
     n_cells = grid["nx"] * grid["ny"]
-    return jnp.sum(cos_x * power) / n_cells**2 / derived["E0_source"] ** 2
+    lit = float(np.mean(np.broadcast_to(np.asarray(swelling) > 0.0, E0.shape)))
+    if lit == 0.0:
+        return jnp.asarray(0.0)
+    return jnp.sum(cos_x * power) / n_cells**2 / derived["E0_source"] ** 2 / lit
 
 
 def get_default_save_func(cfg):

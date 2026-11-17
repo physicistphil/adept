@@ -515,6 +515,8 @@ def _save(cfg, e0):
         (30.0, "constant", None),
         (0.0, "local", {"basis": "linear", "gradient scale length": "30um", "min": 0.15, "max": 0.25}),
         (30.0, "constant", {"basis": "linear", "gradient scale length": "30um", "min": 0.15, "max": 0.25}),
+        # past the critical density the local swelling zeroes the pump: those cells are left out
+        (0.0, "local", {"basis": "linear", "gradient scale length": "30um", "min": 0.5, "max": 1.5}),
     ],
 )
 def test_prescribed_pump_incident_power_is_its_x_flux(angle, swelling, density):
