@@ -235,9 +235,10 @@ class CoupledLight(RamanLight):
         else:
             x_inject = cfg["grid"]["xmax"] - pump["offset"]
         self.i0 = int(np.argmin(np.abs(np.array(self.x) - x_inject)))
-        # pump polarization (drivers.E0.polarization): the two-point injector writes cos(psi) to
+        # the single beam's polarization (drivers.E0.beams[0].polarization, falling back to
+        # drivers.E0.polarization as for every beam): the two-point injector writes cos(psi) to
         # the in-plane transverse component y and sin(psi) to z (plan 2 F.2)
-        psi = float(cfg["drivers"]["E0"].get("derived", {}).get("polarization", 0.0))
+        psi = float(np.atleast_1d(pump.get("beam_polarization", [pump.get("polarization", 0.0)]))[0])
         self.pump_weights = (float(np.cos(psi)), float(np.sin(psi)))
         n_src = float(background_density[self.i0, 0])
         permittivity0 = 1.0 - n_src

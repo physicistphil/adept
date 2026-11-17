@@ -245,6 +245,8 @@ def _cfg_pol(polarization, **kw):
     cfg["terms"]["light"] = {"solver": kw.get("light_solver", "fd"), "pump_depletion": kw.get("pump_depletion", True)}
     if kw.get("angle"):
         cfg["drivers"]["E0"]["angle"] = kw["angle"]
+    if kw.get("beams"):
+        cfg["drivers"]["E0"]["beams"] = kw["beams"]
     return _finish(cfg)
 
 
@@ -295,6 +297,27 @@ def test_s_polarised_pump_lives_in_ez_on_every_injector(path):
     in_plane_p = np.sqrt(np.abs(e0_p[..., 0]) ** 2 + np.abs(e0_p[..., 1]) ** 2)
     np.testing.assert_allclose(np.abs(e0_s[..., 2]), in_plane_p, rtol=1e-9, atol=1e-9 * in_plane_p.max())
     assert np.abs(e0_s[..., :2]).max() <= 1e-12 * in_plane_p.max()
+
+
+@pytest.mark.parametrize("path", ["separate/fd", "separate/spectral", "separate/static"])
+@pytest.mark.parametrize(("driver_pol", "beam_pol"), [("p", "s"), ("s", "p")])
+def test_a_single_beam_takes_its_own_polarization(path, driver_pol, beam_pol):
+    """``drivers.E0.beams[0].polarization`` sets the launched polarization on every injector, the
+    FD two-point row injector of the single axial beam included (it read ``drivers.E0.polarization``,
+    so a ``beams: [{polarization: s}]`` pump was launched p-polarised there). The launch equals the
+    one of ``drivers.E0.polarization: <beam_pol>`` without a beams list; rtol 1e-12."""
+    kw = POL_PATHS[path]
+
+    def run(pol, beams=None):
+        c = _cfg_pol(pol, beams=beams, **kw)
+        c["grid"]["light_substeps"] = 40  # the same light step for every launch
+        return _pump_after(c)[0]
+
+    want = run(beam_pol)
+    got = run(driver_pol, beams=[{"intensity": 1.0, "polarization": beam_pol}])
+    scale = np.abs(want).max()
+    assert scale > 0.0
+    np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12 * scale)
 
 
 def test_intermediate_polarization_splits_cos_sin():
