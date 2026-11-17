@@ -2645,9 +2645,13 @@ def hpe_hist_save(cfg: dict) -> dict:
     ``nv`` (x ``n_windows``, x ``n_angles`` in 2-D) per step the per-step series dominates the
     output; ``make_series_xarrays`` puts these on their own ``t_hist (ps)`` axis."""
     t = np.asarray(cfg["grid"]["t"])
-    stride = max(1, round(cfg["terms"]["hpe"]["hist_save_interval_ps"] / cfg["grid"]["dt"]))
-    idx = np.arange(0, t.size, stride)
-    if idx[-1] != t.size - 1:
+    dt = cfg["grid"]["dt"]
+    stride = max(1, round(cfg["terms"]["hpe"]["hist_save_interval_ps"] / dt))
+    # anchored to the global step index n = t / dt, so a resumed run (whose grid.t starts at the
+    # restart time) continues the unbroken run's histogram schedule
+    steps = np.rint(t / dt).astype(np.int64)
+    idx = np.nonzero(steps % stride == 0)[0]
+    if idx.size == 0 or idx[-1] != t.size - 1:
         idx = np.append(idx, t.size - 1)
     hist_out = _hpe_hist_outputs(cfg)
     # the grid's own step times (same array type as the default series' axis), not re-rounded

@@ -365,6 +365,25 @@ def test_hist_save_interval_thins_only_the_histograms():
         close(thin[k].values, every[k].values, k)
 
 
+def test_hist_save_schedule_continues_across_a_restart():
+    """A resumed run's grid.t starts at the restart time; its histogram saves are the unbroken run's
+    (every n-th global step) from there on, plus its own last step -- not a stride counted from the
+    checkpoint (PR #387 review). Exact step indices."""
+    from adept._lpse2d_cpp.helpers import hpe_hist_save
+
+    dt, nt = 1.0e-3, 200
+
+    def steps(t0_step):
+        t = np.arange(t0_step, nt + 1) * dt
+        cfg = {"grid": {"t": t, "dt": dt}, "terms": {"hpe": {"hist_save_interval_ps": 0.03, "n_windows": 1}}}
+        return np.rint(np.asarray(hpe_hist_save(cfg)["t"]["ax"]) / dt).astype(int).tolist()
+
+    unbroken = steps(0)
+    assert unbroken == [0, 30, 60, 90, 120, 150, 180, 200]
+    for restart in (47, 60, 181, 200):
+        assert steps(restart) == [s for s in unbroken if s >= restart]
+
+
 def test_windowed_dissipation_is_the_energy_the_damping_step_removes():
     """n_windows > 1: epw_dissipation is the energy SpectralEPWSolver.windowed_landau_damping (then the
     collisions) removes, prefactor * factor * (W(phi) - W(phi')) / (dt nx ny^2) with W = sum_k k^2
