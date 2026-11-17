@@ -217,6 +217,7 @@ def test_unified_depletion_is_srs_plus_tpd_depletion_at_quarter_critical():
     lap_phi = jnp.fft.ifft2(-combined.k_sq * phi)
     srs_dep = separate.srs_depletion_coeff0 * lap_phi[..., None] * e_t
     separate.tpd_projection = False
+    separate.tpd_band = None  # the combined path forms E1 div E1 in x-space, unmasked (LightSolver.cpp:4256-4265)
     expected = srs_dep + separate.calc_tpd_depletion(t, phi)
     np.testing.assert_allclose(
         np.asarray(unified), np.asarray(expected), rtol=1e-9, atol=1e-11 * np.abs(expected).max()

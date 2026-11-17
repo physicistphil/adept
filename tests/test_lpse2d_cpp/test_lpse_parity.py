@@ -171,13 +171,54 @@ def test_tpd_depletion_transverse_projection_is_divergence_free():
     ex = np.asarray(jnp.fft.ifft2(-1j * jnp.asarray(cfg["grid"]["kx"])[:, None] * phi_k))
     ey = np.asarray(jnp.fft.ifft2(-1j * jnp.asarray(cfg["grid"]["ky"])[None, :] * phi_k))
     rho = np.asarray(jnp.fft.ifft2(light.k_sq * phi_k))
-    np.testing.assert_allclose(f_raw[..., 0], ex * rho, rtol=1e-11, atol=1e-11 * np.abs(ex * rho).max())
-    np.testing.assert_allclose(f_raw[..., 1], ey * rho, rtol=1e-11, atol=1e-11 * np.abs(ey * rho).max())
+    # unprojected, the term is E div E on the anti-aliased band (test_tpd_depletion_is_band_limited_like_lpse)
+    band = np.asarray(light.tpd_band)
+    for comp, e in ((0, ex), (1, ey)):
+        want = np.fft.ifft2(band * np.fft.fft2(e * rho))
+        np.testing.assert_allclose(f_raw[..., comp], want, rtol=1e-11, atol=1e-11 * np.abs(want).max())
     # the projection only removes the longitudinal part: transverse content is unchanged
     fx_raw_k, fy_raw_k = np.fft.fft2(f_raw[..., 0]), np.fft.fft2(f_raw[..., 1])
     transverse_raw = ky * fx_raw_k - kx * fy_raw_k
     transverse_t = ky * fx_k - kx * fy_k
     np.testing.assert_allclose(transverse_t, transverse_raw, rtol=0, atol=1e-10 * np.abs(transverse_raw).max())
+
+
+def test_tpd_depletion_is_band_limited_like_lpse():
+    """LPSE ``LwSolver::makeTpdPumpDepletion`` (``LwSolver.cpp:1758-1791``), transcribed: E div E is
+    transformed and, mode by mode, replaced by its transverse part where the mode is outside the
+    anti-aliasing region and ``K^2 > 0`` (and inside the kFilter disc), and zeroed everywhere else.
+    The product of two in-band EPW fields reaches twice the band edge; its aliases land outside the
+    band, which the mask removes. Checked on a random in-band potential whose raw product puts
+    > 1 % of its power outside the band; tolerance 1e-10 of the largest mode, fixed in advance."""
+    from adept._lpse2d_cpp.core.light import CoupledLight
+
+    for k_filter in (False, True):
+        cfg = _base_cfg()
+        cfg["terms"]["light"] = {"pump_depletion": True, "tpd_k_filter": k_filter}
+        cfg = _finish_cfg(cfg)
+        light = CoupledLight(cfg)
+        phi_k = _random_phi(cfg, 43)
+        kx = np.asarray(cfg["grid"]["kx"])[:, None]
+        ky = np.asarray(cfg["grid"]["ky"])[None, :]
+        k_sq = kx**2 + ky**2
+        in_aa = np.asarray(cfg["grid"]["light_low_pass_filter_grid"]) > 0.0  # LPSE !insideAntiAliasRegion
+        k0_max_sq = (1.2 * light.w0 / light.c) ** 2 * (1.0 - 0.25) if k_filter else np.inf
+        keep = in_aa & (k_sq > 0.0) & (k_sq < k0_max_sq)
+
+        ex = np.fft.ifft2(-1j * kx * np.asarray(phi_k))
+        ey = np.fft.ifft2(-1j * ky * np.asarray(phi_k))
+        div_e = np.fft.ifft2(k_sq * np.asarray(phi_k))
+        fx, fy = np.fft.fft2(ex * div_e), np.fft.fft2(ey * div_e)
+        out_of_band = np.sum(np.abs(fx[~in_aa]) ** 2 + np.abs(fy[~in_aa]) ** 2)
+        assert out_of_band > 0.01 * np.sum(np.abs(fx) ** 2 + np.abs(fy) ** 2)  # the mask matters here
+        longitudinal = (kx * fx + ky * fy) / np.where(k_sq > 0.0, k_sq, 1.0)
+        want_x = np.where(keep, fx - kx * longitudinal, 0.0)
+        want_y = np.where(keep, fy - ky * longitudinal, 0.0)
+
+        f = np.asarray(light.tpd_depletion_vector(phi_k))
+        scale = max(np.abs(want_x).max(), np.abs(want_y).max())
+        np.testing.assert_allclose(np.fft.fft2(f[..., 0]), want_x, rtol=0, atol=1e-10 * scale)
+        np.testing.assert_allclose(np.fft.fft2(f[..., 1]), want_y, rtol=0, atol=1e-10 * scale)
 
 
 def test_tpd_depletion_k_filter_masks_light_band():

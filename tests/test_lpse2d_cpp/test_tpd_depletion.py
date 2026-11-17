@@ -181,7 +181,11 @@ def test_tpd_reciprocal_coupling_conserves_wave_energy():
     # state in the same band makes the filtered source operator self-adjoint.
     phi_k *= np.asarray(cfg["grid"]["low_pass_filter_grid"] * cfg["grid"]["zero_mask"])
     phi_k = jnp.asarray(phi_k)
-    E0 = jnp.asarray(rng.normal(size=(nx, ny, 2)) + 1j * rng.normal(size=(nx, ny, 2)))
+    E0 = rng.normal(size=(nx, ny, 2)) + 1j * rng.normal(size=(nx, ny, 2))
+    # the pump term lives on the anti-aliased band with k != 0 (LPSE makeTpdPumpDepletion), so the
+    # pair is exactly adjoint for a pump on that band -- where the physical pump content lies
+    band = np.asarray(pump.tpd_band)[..., None]
+    E0 = jnp.asarray(np.fft.ifft2(band * np.fft.fft2(E0, axes=(0, 1)), axes=(0, 1)))
     t = 0.037
 
     ex, ey = epw.phi_k_to_e_fields(phi_k)
@@ -266,7 +270,10 @@ def test_projected_tpd_term_conserves_pair_energy_for_a_transverse_pump():
     # a pump with longitudinal content: mismatch == the longitudinal part's EPW-source rate
     E0_l = jnp.asarray(_longitudinal_part(_random_transverse(cfg, 7404) + 0.0, cfg))  # zero: check helper
     assert float(jnp.abs(E0_l).max()) < 1.0e-9 * float(jnp.abs(E0_t).max())
-    E0_any = jnp.asarray(rng.normal(size=(nx, ny, 2)) + 1j * rng.normal(size=(nx, ny, 2)))
+    # (on the term's band, the anti-aliased one with k != 0: outside it the pump term is zero as LPSE's)
+    band = (np.asarray(cfg["grid"]["light_low_pass_filter_grid"]) * np.asarray(cfg["grid"]["zero_mask"]))[..., None]
+    E0_any = rng.normal(size=(nx, ny, 2)) + 1j * rng.normal(size=(nx, ny, 2))
+    E0_any = jnp.asarray(np.fft.ifft2(band * np.fft.fft2(E0_any, axes=(0, 1)), axes=(0, 1)))
     E0_long = jnp.asarray(_longitudinal_part(E0_any, cfg))
     pump_any, epw_any = _pair_energy_rates(cfg, phi_k, E0_any)
     _, epw_long = _pair_energy_rates(cfg, phi_k, E0_long)

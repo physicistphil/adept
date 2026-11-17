@@ -75,13 +75,14 @@ class CoupledLight(RamanLight):
 
     for every pump component, with ``[.]_T`` the transverse (divergence-free) part taken
     in k-space (``terms.light.tpd_projection``, default on) so that a longitudinal
-    component is never injected into the light field; ``terms.light.tpd_k_filter``
-    additionally restricts the term to ``|k| < 1.2 k0 sqrt(1 - n_min)`` (LPSE
-    ``lw.kFilter``). The coefficient is exactly twice the EPW-side TPD source coefficient
-    ``i e/(4 me w0)``: with that ratio the pair conserves ``|E0|^2 + (2 wp0/w0)|Eh|^2``
-    for the coupling terms alone, i.e. the total wave energy at envelope density n_c/4
-    (settled against the equation document on 2026-09-14; adept main previously carried
-    half this coefficient).
+    component is never injected into the light field, and restricted, as LPSE's, to the
+    anti-aliased band with ``k != 0`` (the product's aliases land outside it);
+    ``terms.light.tpd_k_filter`` additionally restricts the term to
+    ``|k| < 1.2 k0 sqrt(1 - n_min)`` (LPSE ``lw.kFilter``). The coefficient is exactly twice
+    the EPW-side TPD source coefficient ``i e/(4 me w0)``: with that ratio the pair conserves
+    ``|E0|^2 + (2 wp0/w0)|Eh|^2`` for an in-band pump and the coupling terms alone, i.e. the
+    total wave energy at envelope density n_c/4 (settled against the equation document on
+    2026-09-14; adept main previously carried half this coefficient).
 
     The pump injector is the stencil's plane-wave injector (``RamanLight.injector_rows``:
     the two-point source at second order, wider at ``terms.light.fd_order`` 4 / 6) with
@@ -155,6 +156,15 @@ class CoupledLight(RamanLight):
             self.tpd_k_mask = jnp.asarray(np.where((k_sq_np > 0) & (k_sq_np < k0_max_sq), 1.0, 0.0))
         else:
             self.tpd_k_mask = None
+        # LPSE LwSolver::makeTpdPumpDepletion (LwSolver.cpp:1778-1791) keeps E div(E) only on the
+        # anti-aliased band with K^2 > 0 (and inside the kFilter disc): the product of two in-band
+        # EPW fields reaches twice the band edge, and its aliases land outside the band, so the
+        # mask removes them. The band is the grid's anti-aliasing mask without the EPW's own
+        # terms.epw.max_wavenumber cap (light_low_pass_filter_grid; LPSE's insideAntiAliasRegion)
+        band = np.asarray(cfg["grid"]["light_low_pass_filter_grid"], dtype=np.float64) * np.where(k_sq_np > 0, 1.0, 0.0)
+        if self.tpd_k_mask is not None:
+            band = band * np.asarray(self.tpd_k_mask)
+        self.tpd_band = jnp.asarray(band)
 
         # how the SRS E0 <-> E1 exchange enters the light sub-step (see the class docstring)
         self.coupling = str(light_cfg.get("coupling", "explicit"))
@@ -570,25 +580,23 @@ class CoupledLight(RamanLight):
         """``[E_h div(E_h)]_T`` in real space, shape (nx, ny, 2), from the frozen potential.
 
         ``div_e`` uses the same potential convention as the EPW TPD source:
-        ``div_e = ifft2(k^2 phi_k)``. The transverse projection and the optional k-filter
-        are LPSE's ``LwSolver::makeExyzDivE``: ``F_T = F - k (k . F) / k^2`` mode by mode.
+        ``div_e = ifft2(k^2 phi_k)``. The transverse projection, the band mask and the optional
+        k-filter are LPSE's ``LwSolver::makeTpdPumpDepletion`` (``LwSolver.cpp:1778-1791``):
+        ``F_T = F - k (k . F) / k^2`` on the anti-aliased band with ``k != 0``, zero elsewhere.
         """
         ex = jnp.fft.ifft2(-1j * self.kx[:, None] * phi_k)
         ey = jnp.fft.ifft2(-1j * self.ky[None, :] * phi_k)
         div_e = jnp.fft.ifft2(self.k_sq * phi_k)
-        fx, fy = ex * div_e, ey * div_e
-        if self.tpd_projection or self.tpd_k_mask is not None:
-            fx_k = jnp.fft.fft2(fx)
-            fy_k = jnp.fft.fft2(fy)
-            if self.tpd_projection:
-                longitudinal = self.kx[:, None] * fx_k + self.ky[None, :] * fy_k
-                fx_k = fx_k - self.kx_over_k_sq * longitudinal
-                fy_k = fy_k - self.ky_over_k_sq * longitudinal
-            if self.tpd_k_mask is not None:
-                fx_k = fx_k * self.tpd_k_mask
-                fy_k = fy_k * self.tpd_k_mask
-            fx, fy = jnp.fft.ifft2(fx_k), jnp.fft.ifft2(fy_k)
-        return jnp.stack([fx, fy], axis=-1)
+        fx_k = jnp.fft.fft2(ex * div_e)
+        fy_k = jnp.fft.fft2(ey * div_e)
+        if self.tpd_projection:
+            longitudinal = self.kx[:, None] * fx_k + self.ky[None, :] * fy_k
+            fx_k = fx_k - self.kx_over_k_sq * longitudinal
+            fy_k = fy_k - self.ky_over_k_sq * longitudinal
+        if self.tpd_band is not None:
+            fx_k = fx_k * self.tpd_band
+            fy_k = fy_k * self.tpd_band
+        return jnp.stack([jnp.fft.ifft2(fx_k), jnp.fft.ifft2(fy_k)], axis=-1)
 
     def calc_tpd_depletion(self, t: float, phi_k: Array) -> Array:
         """Return the reciprocal TPD term for both pump components, shape (nx, ny, 2)."""
