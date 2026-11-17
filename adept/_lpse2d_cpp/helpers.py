@@ -2494,6 +2494,70 @@ def epw_total_energy_factor(cfg: dict) -> np.ndarray:
     return 2.0 * float(cfg["units"]["envelope density"]) / n
 
 
+def pump_riemann_angles(cfg: dict, ix: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per transverse mode ``k_y`` (FFT order), the grid phase advance ``theta = k_x dx`` of a pump wave
+    at the x-probe row ``ix`` and whether that mode propagates: ``k_x^2 = (w0/c)^2 (1 - n) - k_y^2`` at the
+    row's mean density, with the FD light solver's stencil dispersion (``stencils.grid_wavenumber``, the
+    y stencil's ``-sigma(k_y dy)/dy^2`` for ``k_y^2``) or the spectral solver's exact one."""
+    from adept._lpse2d_cpp.core.stencils import grid_wavenumber, symbol
+
+    derived, grid = cfg["units"]["derived"], cfg["grid"]
+    light = cfg["terms"].get("light", {})
+    dx, ny = grid["dx"], int(grid["ny"])
+    n_loc = float(np.mean(np.asarray(grid["background_density"])[ix, :]))
+    k_sq = (derived["w0"] / derived["c"]) ** 2 * (1.0 - n_loc)
+    ky = np.asarray(grid["ky"], dtype=np.float64)
+    if light.get("solver", "fd") == "spectral":
+        kx_sq = k_sq - ky**2
+        theta = np.sqrt(np.maximum(kx_sq, 0.0)) * dx
+    else:
+        order = int(light.get("fd_order", 2))
+        ky_eff_sq = -symbol(order, ky * grid["dy"]) / grid["dy"] ** 2 if ny > 1 else np.zeros_like(ky)
+        kx_sq = k_sq - ky_eff_sq
+        theta = np.array([grid_wavenumber(np.sqrt(v) * dx, order) if v > 0.0 else 0.0 for v in kx_sq])
+    propagating = (kx_sq > 0.0) & (np.sin(theta) > 1.0e-6)
+    return theta, propagating
+
+
+def pump_one_way_flux(E, ix: int, direction: int, theta, propagating, coeff: float):
+    """The one-way part of the two-point x-flux ``coeff <Im(E_ix^* . E_ix+1)>_y`` of the field ``E``
+    (``nx, ny, nc``) at row ``ix``: toward +x for ``direction = +1``, toward -x for ``-1``.
+
+    Per transverse mode the rows hold ``A + B`` and ``A e^{i theta} + B e^{-i theta}`` (``theta`` from
+    ``pump_riemann_angles``), which give the right-going ``A`` and left-going ``B``; the net two-point
+    flux of the mode is exactly ``sin(theta) (|A|^2 - |B|^2)``, so the two one-way parts sum to the net
+    flux for any field. With ``theta`` off the field's own wavenumber by ``d theta``, the split of a
+    single wave is wrong only at second order in ``d theta``. Evanescent modes are left out."""
+    ej = jnp.fft.fft(E[ix], axis=0)
+    ej1 = jnp.fft.fft(E[ix + 1], axis=0)
+    theta = jnp.asarray(theta)[:, None]
+    prop = jnp.asarray(propagating)[:, None]
+    two_i_sin = jnp.where(prop, 2j * jnp.sin(theta), 1.0)
+    if direction > 0:
+        amp = (ej1 - ej * jnp.exp(-1j * theta)) / two_i_sin
+    else:
+        amp = (ej * jnp.exp(1j * theta) - ej1) / two_i_sin
+    weight = jnp.where(prop, jnp.sin(theta), 0.0)
+    return coeff * jnp.sum(weight * jnp.abs(amp) ** 2) / E.shape[1] ** 2
+
+
+def prescribed_pump_x_flux(cfg: dict, E0, swelling):
+    """The x-flux of the prescribed pump ``E0`` (``nx, ny, nc``) in units of the nominal ``I0_code``, as
+    the vacuum intensity it represents, both faces' beams counted positive: the swelling factor is divided
+    out (``laser.Light``'s, where it is non-zero), and each Fourier mode of the box contributes
+    ``c |E_k|^2 |k_x| / |k|``. Exact for the prescribed grid modes; it follows the beams' angles and
+    fractions, the envelope, the pulse shape and a speckle profile, whatever their normalisation."""
+    derived, grid = cfg["units"]["derived"], cfg["grid"]
+    kx = np.asarray(grid["kx"], dtype=np.float64)[:, None]
+    ky = np.asarray(grid["ky"], dtype=np.float64)[None, :]
+    k_mag = np.sqrt(kx**2 + ky**2)
+    cos_x = jnp.asarray(np.where(k_mag > 0.0, np.abs(kx) / np.where(k_mag > 0.0, k_mag, 1.0), 0.0))
+    vacuum = jnp.where(swelling > 0.0, E0 / jnp.where(swelling > 0.0, swelling, 1.0), 0.0)
+    power = jnp.sum(jnp.abs(jnp.fft.fft2(vacuum, axes=(0, 1))) ** 2, axis=-1)
+    n_cells = grid["nx"] * grid["ny"]
+    return jnp.sum(cos_x * power) / n_cells**2 / derived["E0_source"] ** 2
+
+
 def get_default_save_func(cfg):
     from adept._lpse2d_cpp.core.epw import analytic_landau_rate
 
@@ -2684,6 +2748,29 @@ def get_default_save_func(cfg):
             cross = jnp.sum(jnp.conj(E[ix, :, :]) * E[ix + 1, :, :], axis=-1)
             return coeff * jnp.mean(jnp.imag(cross))
 
+        if pump_evolved:
+            # the incident pump power: the one-way flux of the pump into the box at its entrance probe(s)
+            # (right-going at the x-min probe, left-going at the x-max probe when a beam enters there),
+            # in the same two-point measure as the net probes; see pump_one_way_flux
+            pump_leftward = np.atleast_1d(np.asarray(cfg["drivers"]["E0"]["derived"].get("beam_leftward", [False])))
+            inflow_faces = []
+            if not bool(np.all(pump_leftward)):
+                inflow_faces.append((ix_left_e0, +1, corr_e0_left))
+            if bool(np.any(pump_leftward)):
+                inflow_faces.append((ix_right_e0, -1, corr_e0_right))
+            inflow_split = [
+                (ix, direction, corr, *pump_riemann_angles(cfg, ix)) for ix, direction, corr in inflow_faces
+            ]
+
+    # the prescribed pump's incident power (incident_pump_flux): its vacuum-equivalent x-flux, from the
+    # field the solver applies (prescribed_pump_x_flux)
+    prescribed_pump = "E0" in cfg["drivers"] and not pump_evolved and derived["E0_source"] > 0.0
+    if prescribed_pump:
+        from adept._lpse2d_cpp.core.laser import Light
+
+        pump_swelling = Light(cfg).swelling
+        pump_swelling = pump_swelling[..., None] if not isinstance(pump_swelling, float) else pump_swelling
+
     ledger_on = bool(cfg["terms"]["epw"].get("energy_ledger", False))
     if ledger_on:
         from adept._lpse2d_cpp.core.epw import LEDGER_CHANNELS, LEDGER_KEY
@@ -2831,6 +2918,16 @@ def get_default_save_func(cfg):
                 # net E0 flux. Keep the four-channel budget schema with zero Raman flux.
                 out["reflected_flux"] = jnp.asarray(0.0)
                 out["backrefl_flux"] = jnp.asarray(0.0)
+            if pump_evolved:
+                out["incident_pump_flux"] = (
+                    sum(
+                        pump_one_way_flux(e0, ix, direction, theta, propagating, flux_coeff_w0) / corr
+                        for ix, direction, corr, theta, propagating in inflow_split
+                    )
+                    / I0_code
+                )
+        if prescribed_pump:
+            out["incident_pump_flux"] = prescribed_pump_x_flux(cfg, y["E0"].view(jnp.complex128), pump_swelling)
 
         return out
 

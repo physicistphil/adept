@@ -15,7 +15,14 @@ Unit conventions:
 - ``epw_energy`` and ``epw_dissipation`` are already converted to OSIRIS code
   units by the save function (fields in ``me*c*w0/e``, lengths in ``c/w0``).
 - Flux series (``incident_flux``, ``reflected_flux``, ``transmitted_flux``,
-  ``backrefl_flux``) are normalized to the nominal incident flux ``I0_code``.
+  ``backrefl_flux``, ``incident_pump_flux``) are normalized to the nominal incident flux ``I0_code``.
+- Every laser-budget fraction (``laser_reflectivity`` / ``_transmissivity`` / ``_absorbed_frac``, their
+  naive and per-segment variants, ``laser_absorbed_frac_epw``, ``electron_energy_frac_final``) is a
+  fraction of the incident laser power the run actually delivered, ``incident_pump_flux``: the pump's
+  one-way flux into the box at its entrance probe(s) (evolved pump) or the prescribed pump's own x-flux.
+  ``osiris_lpi`` divides by the nominal ``I0 = (a0 w0)^2 / 2`` instead; the two agree when the launched
+  flux equals the nominal one (``laser_incident_flux_ratio`` here, ``laser_incident_measured_frac``
+  there, equal to 1).
 """
 
 from __future__ import annotations
@@ -241,100 +248,109 @@ def series_metrics(series, cfg: dict) -> dict[str, float]:
     if "epw_growth_rate" in fit:
         metrics["epw_growth_rate_per_ps"] = fit["epw_growth_rate"] * w0
 
-    # Electron energy: cumulative EPW dissipation (Landau + collisional), i.e. the
-    # energy handed to electrons. epw_dissipation is OSIRIS energy per ps, so the
-    # trapezoid over t (ps) gives OSIRIS energy; the incident fluence is
-    # I0_osiris * t_w0 with I0_osiris = a0^2/2 (flux in OSIRIS units).
+    # The incident laser power, in units of the nominal I0_code: the pump's one-way flux into the box
+    # at its entrance probe(s) (evolved pump: right-going at the x-min probe, left-going at the x-max
+    # probe when a beam enters there; it carries the injector's launch deficit and none of the pump
+    # light leaving the box) or the prescribed pump's own x-flux (beam angles and fractions, envelope,
+    # pulse shape). Every fraction below divides by it, window by window.
+    inc_in = np.asarray(series["incident_pump_flux"].values, dtype=float) if "incident_pump_flux" in series else None
     a0 = derived["E0_source"] * derived["e_norm"]
-    I0_osiris = 0.5 * a0**2
+    I0_osiris = 0.5 * a0**2  # the nominal flux in OSIRIS units
+
+    # Electron energy: cumulative EPW dissipation (Landau + collisional), i.e. the energy handed to
+    # electrons. epw_dissipation is OSIRIS energy per ps, so the trapezoid over t (ps) gives OSIRIS
+    # energy; the delivered laser fluence is I0_osiris * int(incident_pump_flux d(t w0)).
     if "epw_dissipation" in series:
         dissip_ps = np.asarray(series["epw_dissipation"].values, dtype=float)
         electron_energy = np.concatenate([[0.0], np.cumsum(0.5 * (dissip_ps[1:] + dissip_ps[:-1]) * np.diff(t_ps))])
         metrics["electron_energy_final"] = float(electron_energy[-1])
-        if t_w0[-1] > 0:
-            metrics["electron_energy_frac_final"] = float(electron_energy[-1] / (I0_osiris * t_w0[-1]))
+        if inc_in is not None and t_ps.size > 1:
+            fluence = I0_osiris * float(np.sum(0.5 * (inc_in[1:] + inc_in[:-1]) * np.diff(t_w0)))
+            if fluence > 0.0:
+                metrics["electron_energy_frac_final"] = float(electron_energy[-1] / fluence)
 
-    # Laser budget. Flux series are already normalized to the nominal incident flux
-    # I0_code. With the pump prescribed (no depletion) only the one-way "naive"
-    # estimators are meaningful; with pump depletion on, the net-Poynting R/T/absorbed
-    # match osiris_lpi/laser_budget.py exactly (R = 1 - S_left/I0, T = S_right/I0,
-    # absorbed = (S_left - S_right)/I0, so R + T + absorbed == 1 identically).
+    # Laser budget. The flux probes are signed +x fluxes (incident / transmitted: the pump at the left /
+    # right probe; reflected: minus the Raman flux at the left; backrefl: the Raman flux at the right),
+    # so the budget assumes illumination from x-min. A pump entering at x-max (every beam leftward,
+    # drivers.E0 beam_leftward) is the mirror image x -> -x: its net incident flux is minus the right
+    # probe's, its transmitted flux minus the left probe's, and the reflected / forward Raman probes
+    # swap, after which the same budget applies. With beams entering from both faces reflection and
+    # transmission cannot be told apart: only the signed net fluxes at both faces
+    # (laser_net_flux_left / _right) and laser_absorbed_frac_epw are logged.
     #
-    # The flux probes are signed +x fluxes (incident / transmitted: the pump at the left / right
-    # probe; reflected: minus the Raman flux at the left; backrefl: the Raman flux at the right),
-    # so the budget above assumes illumination from x-min. A pump entering at x-max (every beam
-    # leftward, drivers.E0 beam_leftward) is the mirror image x -> -x: its incident flux is minus
-    # the right probe's, its transmitted flux minus the left probe's, and the reflected / forward
-    # Raman probes swap, after which the same budget applies. With beams entering from both faces
-    # the net probes cannot separate incoming from outgoing power: the fraction metrics are not
-    # logged, only the signed net fluxes at both faces (laser_net_flux_left / _right).
+    # With the pump evolved, R / T / absorbed are net-Poynting fractions of the incident power:
+    # R = 1 - S_left / I_in, T = S_right / I_in, absorbed = (S_left - S_right) / I_in, so
+    # R + T + absorbed == 1 identically and R counts the Raman light and the pump light leaving through
+    # the entrance (SBS, the turning point): R_SRS + R_E0. With the pump prescribed only the one-way
+    # Raman flux is meaningful: R = reflected / I_in, and there is no transmission / absorption budget.
     pump_evolved = bool(cfg["terms"].get("light", {}).get("pump_depletion", False))
-    have_flux = all(k in series for k in ("incident_flux", "reflected_flux", "transmitted_flux", "backrefl_flux"))
+    # without a pump (no drivers.E0, e.g. a Raman seed alone) there is no incident power and no fraction
+    have_flux = inc_in is not None and all(
+        k in series for k in ("incident_flux", "reflected_flux", "transmitted_flux", "backrefl_flux")
+    )
     leftward = np.atleast_1d(
         np.asarray(cfg["drivers"].get("E0", {}).get("derived", {}).get("beam_leftward", [False]), dtype=bool)
     )
     two_sided = bool(np.any(leftward)) and not bool(np.all(leftward))
+    windows = segment_windows(t_ps, last_frac=0.25, n_segments=4)
+    # a window whose mean incident power is below 1e-3 of the largest window's (the laser not yet on)
+    # gets no fractions
+    inc_floor = 0.0
+    if inc_in is not None:
+        inc_means = [_wmean(inc_in, win["mask"]) for win in windows]
+        inc_floor = 1.0e-3 * max([m for m in inc_means if m is not None] or [0.0])
+    dissip = np.asarray(series["epw_dissipation"].values, dtype=float) if "epw_dissipation" in series else None
+
+    def incident_in(win) -> float | None:
+        i_in = _wmean(inc_in, win["mask"]) if inc_in is not None else None
+        return i_in if i_in is not None and np.isfinite(i_in) and i_in > inc_floor else None
+
+    def absorbed_frac_epw(win, i_in, suffix):
+        d = _wmean(dissip, win["mask"]) if dissip is not None else None
+        if d is not None and I0_osiris > 0:
+            metrics[f"laser_absorbed_frac_epw{suffix}"] = d / w0 / I0_osiris / i_in
+
     if have_flux:
         inc = np.asarray(series["incident_flux"].values, dtype=float)
         refl = np.asarray(series["reflected_flux"].values, dtype=float)
         trans = np.asarray(series["transmitted_flux"].values, dtype=float)
         backrefl = np.asarray(series["backrefl_flux"].values, dtype=float)
         if two_sided:
-            for win in segment_windows(t_ps, last_frac=0.25, n_segments=4):
+            for win in windows:
                 suffix = "" if win["is_last"] else f"_seg{win['index']}of{win['n']}"
                 net_left = _wmean(inc - refl, win["mask"])
                 if net_left is None:
                     continue
                 metrics[f"laser_net_flux_left{suffix}"] = net_left
                 metrics[f"laser_net_flux_right{suffix}"] = _wmean(trans + backrefl, win["mask"])
-                if "epw_dissipation" in series and I0_osiris > 0:
-                    d = _wmean(np.asarray(series["epw_dissipation"].values, dtype=float), win["mask"])
-                    if d is not None:
-                        metrics[f"laser_absorbed_frac_epw{suffix}"] = d / w0 / I0_osiris
+                i_in = incident_in(win)
+                if i_in is not None:
+                    absorbed_frac_epw(win, i_in, suffix)
             have_flux = False
         elif bool(np.all(leftward)):
             inc, trans, refl, backrefl = -trans, -inc, backrefl, refl
     if have_flux:
         s_left = inc - refl  # F0_left + F1_left, in units of I0_code (entrance face)
         s_right = trans + backrefl
-
-        # With an evolved pump the injector's launched amplitude carries a small grid-
-        # dispersion deficit (sin(k0 dx)/sin(k_grid dx), ~2% at 8 cells/wavelength), so
-        # the budget is normalized to the *measured* incident flux -- i.e. fractions of
-        # the pump that actually entered the box, exactly like OSIRIS normalizes to its
-        # own launched flux. With a prescribed pump the physical incident flux is
-        # nominal by construction, so normalize by 1.
-        inc_ref = 1.0
-        if pump_evolved and len(inc) > 1:
-            inc_ref = float(np.mean(inc[len(inc) // 2 :]))
-            if not np.isfinite(inc_ref) or inc_ref <= 0:
-                inc_ref = 1.0
-
-        windows = segment_windows(t_ps, last_frac=0.25, n_segments=4)
         for win in windows:
             suffix = "" if win["is_last"] else f"_seg{win['index']}of{win['n']}"
+            i_in = incident_in(win)
             r_naive = _wmean(refl, win["mask"])
-            t_naive = _wmean(trans, win["mask"])
-            if r_naive is None:
+            if r_naive is None or i_in is None:
                 continue
-            metrics[f"laser_reflectivity_naive{suffix}"] = r_naive / inc_ref
-            metrics[f"laser_transmissivity_naive{suffix}"] = t_naive / inc_ref
+            metrics[f"laser_reflectivity_naive{suffix}"] = r_naive / i_in
+            metrics[f"laser_transmissivity_naive{suffix}"] = _wmean(trans, win["mask"]) / i_in
             if pump_evolved:
-                metrics[f"laser_reflectivity{suffix}"] = 1.0 - _wmean(s_left, win["mask"]) / inc_ref
-                metrics[f"laser_transmissivity{suffix}"] = _wmean(s_right, win["mask"]) / inc_ref
-                metrics[f"laser_absorbed_frac{suffix}"] = _wmean(s_left - s_right, win["mask"]) / inc_ref
+                metrics[f"laser_reflectivity{suffix}"] = 1.0 - _wmean(s_left, win["mask"]) / i_in
+                metrics[f"laser_transmissivity{suffix}"] = _wmean(s_right, win["mask"]) / i_in
+                metrics[f"laser_absorbed_frac{suffix}"] = _wmean(s_left - s_right, win["mask"]) / i_in
             else:
-                # pump is prescribed: the one-way Raman flux is the only measurable
-                # reflectivity, and there is no transmission/absorption budget
-                metrics[f"laser_reflectivity{suffix}"] = r_naive / inc_ref
-            if "epw_dissipation" in series:
-                d = _wmean(np.asarray(series["epw_dissipation"].values, dtype=float), win["mask"])
-                if d is not None and I0_osiris > 0:
-                    metrics[f"laser_absorbed_frac_epw{suffix}"] = d / w0 / I0_osiris
+                metrics[f"laser_reflectivity{suffix}"] = r_naive / i_in
+            absorbed_frac_epw(win, i_in, suffix)
 
-        # injector/prescription health: the measured incident flux should be ~1
-        # (skip the first 5% of the run to avoid the fill-in transient)
-        metrics["laser_incident_flux_ratio"] = float(np.mean(inc[max(1, len(inc) // 20) :]))
+        # the delivered incident power relative to the nominal I0 (the injector's launch efficiency, or
+        # the prescribed pump's x-projection), skipping the first 5 % of the run (the fill-in transient)
+        metrics["laser_incident_flux_ratio"] = float(np.mean(inc_in[max(1, len(inc_in) // 20) :]))
 
     # --- HPE hot-electron metrics, named to match the OSIRIS scan2 set ---
     if "fhot_50keV" in series:

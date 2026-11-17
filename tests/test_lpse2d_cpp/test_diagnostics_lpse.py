@@ -477,3 +477,218 @@ def test_srs_couplings_conserve_the_factor_weighted_epw_energy():
     factor = epw_total_energy_factor(cfg)
     assert np.ptp(factor) == 0.0
     np.testing.assert_allclose(weights, float(factor.flat[0]) / 2.0, rtol=1e-10)
+
+
+# --- the incident laser power and the laser-budget denominators (physics review 2026-11-16, C1, C2, C4) ---
+
+
+def _pump_box(angle, *, pump_depletion, light_solver="fd", density=None, swelling="constant"):
+    with open("tests/test_lpse2d_cpp/configs/srs.yaml") as fi:
+        cfg = deepcopy(yaml.safe_load(fi))
+    cfg["grid"].update({"xmax": "12.8um", "tmax": "10fs", "ymax": "3.2um", "ymin": "-3.2um", "dx": "0.05um"})
+    cfg["terms"]["light"] = {"solver": light_solver, "pump_depletion": pump_depletion}
+    cfg["terms"]["epw"]["source"]["noise"] = False
+    cfg["terms"]["epw"]["boundary"] = {"x": "absorbing" if pump_depletion else "periodic", "y": "periodic"}
+    cfg["drivers"]["E0"]["angle"] = angle
+    cfg["drivers"]["E0"]["swelling"] = swelling
+    if density is not None:
+        cfg["density"] = density
+    cfg["save"]["fields"].pop("x", None)
+    cfg["save"]["fields"].pop("y", None)
+    return _finish(cfg)
+
+
+def _save(cfg, e0):
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    y = {
+        "epw": jnp.zeros((nx, ny), dtype=jnp.complex128).view(jnp.float64),
+        "E0": jnp.asarray(e0, dtype=jnp.complex128).view(jnp.float64),
+        "E1": jnp.zeros(e0.shape, dtype=jnp.complex128).view(jnp.float64),
+    }
+    return {k: float(v) for k, v in cfg["save"]["default"]["func"](0.0, y, None).items() if np.ndim(v) == 0}
+
+
+@pytest.mark.parametrize(
+    "angle, swelling, density",
+    [
+        (0.0, "constant", None),
+        (30.0, "constant", None),
+        (0.0, "local", {"basis": "linear", "gradient scale length": "30um", "min": 0.15, "max": 0.25}),
+        (30.0, "constant", {"basis": "linear", "gradient scale length": "30um", "min": 0.15, "max": 0.25}),
+    ],
+)
+def test_prescribed_pump_incident_power_is_its_x_flux(angle, swelling, density):
+    """The prescribed pump's incident_pump_flux (units of I0) is the x-projection of the beam it
+    represents: cos of the grid-snapped beam direction (laser.Light snaps kx and ky), with either swelling
+    model, on a uniform box or a ramp. Reference: the snapped direction from k0(n_env) rounded to the grid,
+    computed here. rtol 1e-9, fixed before the run (round-off of the FFT sums). The net two-point probe the
+    budget divided by before (incident_flux) reads 0.987 at 0 deg and 0.865 at 30 deg on this grid."""
+    from adept._lpse2d_cpp.core.laser import Light
+
+    cfg = _pump_box(angle, pump_depletion=False, density=density, swelling=swelling)
+    ny = cfg["grid"]["ny"]
+    lw = {"delta_omega": jnp.array([0.0]), "intensities": jnp.ones((1, ny)), "phases": jnp.zeros((1, ny))}
+    e0 = np.asarray(Light(cfg).laser_update(0.0, None, lw))
+    d = cfg["units"]["derived"]
+    k0 = d["w0"] / d["c"] * np.sqrt(1.0 - cfg["units"]["envelope density"])
+    dk = 2.0 * np.pi / (cfg["grid"]["nx"] * cfg["grid"]["dx"])
+    dky = 2.0 * np.pi / (ny * cfg["grid"]["dy"])
+    kx = np.round(k0 * np.cos(np.deg2rad(angle)) / dk) * dk
+    ky = np.round(k0 * np.sin(np.deg2rad(angle)) / dky) * dky
+    np.testing.assert_allclose(_save(cfg, e0)["incident_pump_flux"], kx / np.hypot(kx, ky), rtol=1e-9)
+
+
+def _discrete_plane_wave(cfg, iky, direction, amp, light_solver):
+    """A pump plane wave on the solver's own dispersion at the box's uniform density, transverse mode
+    ``ky[iky]``, travelling toward +x (``direction = 1``) or -x, polarised along z (all rows)."""
+    grid, d = cfg["grid"], cfg["units"]["derived"]
+    n = float(np.asarray(grid["background_density"])[0, 0])
+    k_sq = (d["w0"] / d["c"]) ** 2 * (1.0 - n)
+    ky = float(np.asarray(grid["ky"])[iky])
+    dx, dy = grid["dx"], grid["dy"]
+    if light_solver == "spectral":
+        theta = np.sqrt(k_sq - ky**2) * dx
+    else:  # second-order stencils in x and y: (2 - 2 cos(ky dy))/dy^2 + (2 - 2 cos theta)/dx^2 = k^2
+        ky_eff_sq = (2.0 - 2.0 * np.cos(ky * dy)) / dy**2
+        theta = np.arccos(1.0 - (k_sq - ky_eff_sq) * dx**2 / 2.0)
+    j = np.arange(grid["nx"])[:, None]
+    y = np.asarray(grid["y"])[None, :]
+    e = np.zeros((grid["nx"], grid["ny"], 3), dtype=np.complex128)
+    e[..., 2] = amp * np.exp(1j * (direction * theta * j + ky * y))
+    return e
+
+
+@pytest.mark.parametrize("light_solver", ["fd", "spectral"])
+@pytest.mark.parametrize("angle", [0.0, 180.0])
+def test_evolved_pump_incident_power_is_the_inflowing_one_way_flux(light_solver, angle):
+    """With the pump evolved, incident_pump_flux is the one-way flux into the box at the entrance probe:
+    for a field of two inflowing waves (normal and oblique) plus two outflowing ones (reflected pump
+    light), it equals the net probe flux of the inflowing waves alone, at the x-min probe (beams at 0 deg)
+    or the x-max probe (180 deg). rtol 1e-9, fixed before the run (round-off): the split is exact for
+    waves on the solver's dispersion at the probe density, built here from the second-order stencil
+    relation or the exact one. Before the fix the budget divided by the net flux, which the outflowing
+    waves reduce."""
+    cfg = _pump_box(angle, pump_depletion=True, light_solver=light_solver)
+    rightward = angle == 0.0
+    sign = 1 if rightward else -1
+    inflow = _discrete_plane_wave(cfg, 0, sign, 0.8, light_solver) + _discrete_plane_wave(
+        cfg, 3, sign, 0.3 - 0.2j, light_solver
+    )
+    outflow = _discrete_plane_wave(cfg, 0, -sign, 0.25j, light_solver) + _discrete_plane_wave(
+        cfg, -5, -sign, 0.1, light_solver
+    )
+    e0_source = cfg["units"]["derived"]["E0_source"]
+    inflow, outflow = inflow * e0_source, outflow * e0_source
+    full, inflow_only = _save(cfg, inflow + outflow), _save(cfg, inflow)
+    probe = "incident_flux" if rightward else "transmitted_flux"
+    want = sign * inflow_only[probe]
+    assert want > 0.5  # the inflowing waves carry most of the nominal flux
+    assert abs(full[probe]) < 0.95 * want  # the outflowing waves reduce the net flux by > 5 %
+    np.testing.assert_allclose(full["incident_pump_flux"], want, rtol=1e-9)
+
+
+def _budget_cfg(*, pump_depletion, leftward=False):
+    w0 = 5.366e3  # rad/ps at 351 nm
+    return {
+        "units": {"derived": {"w0": w0, "E0_source": 2.0e-3, "e_norm": 7.0e2}},
+        "terms": {"epw": {"source": {"noise": False}}, "light": {"pump_depletion": pump_depletion}},
+        "drivers": {"E0": {"derived": {"beam_leftward": np.array([leftward])}}},
+    }
+
+
+def _series(t, **kw):
+    import xarray as xr
+
+    data = {"epw_energy": xr.DataArray(1e-6 * np.exp(t), coords=(("t (ps)", t),))}
+    for k, v in kw.items():
+        data[k] = xr.DataArray(np.broadcast_to(np.asarray(v, dtype=float), t.shape).copy(), coords=(("t (ps)", t),))
+    return xr.Dataset(data)
+
+
+@pytest.mark.parametrize("leftward", [False, True])
+def test_evolved_budget_is_a_fraction_of_the_incident_power(leftward):
+    """Evolved pump, steady state: the injector delivers I_in = 0.98 I0, the pump light leaving through the
+    entrance is R_E0 = 0.10, the Raman light R_SRS = 0.05, the plasma absorbs A = 0.20 (all of it through
+    the EPW) and T = 0.65. The budget must report R = R_SRS + R_E0 = 0.15, T = 0.65, absorbed = 0.20,
+    laser_absorbed_frac_epw = electron_energy_frac_final = 0.20 and laser_incident_flux_ratio = 0.98, for
+    the x-min entrance and its mirror image (every beam leftward). Exact arithmetic: rtol 1e-12, fixed
+    before the run. Before the fix: R = R_SRS / (1 - R_E0) = 0.056, A_epw = 0.196, ratio 0.882."""
+    from adept._lpse2d_cpp.diagnostics import series_metrics
+
+    cfg = _budget_cfg(pump_depletion=True, leftward=leftward)
+    d = cfg["units"]["derived"]
+    i0_osiris = 0.5 * (d["E0_source"] * d["e_norm"]) ** 2
+    i_in, r_e0, r_srs, absorbed = 0.98, 0.10, 0.05, 0.20
+    t = np.linspace(0.0, 4.0, 401)
+    net_pump_left, raman_left = i_in * (1.0 - r_e0), i_in * r_srs  # the entrance face
+    pump_right = i_in * (1.0 - r_e0 - r_srs - absorbed)
+    dissipation = absorbed * i_in * d["w0"] * i0_osiris
+    if not leftward:
+        flux = dict(incident_flux=net_pump_left, reflected_flux=raman_left, transmitted_flux=pump_right)
+    else:  # x -> -x: the entrance is the x-max face, every flux is a signed +x flux
+        flux = dict(incident_flux=-pump_right, backrefl_flux=raman_left, transmitted_flux=-net_pump_left)
+    flux = {"reflected_flux": 0.0, "backrefl_flux": 0.0, **flux}
+    series = _series(t, incident_pump_flux=i_in, epw_dissipation=dissipation, **flux)
+    m = series_metrics(series, cfg)
+    for key, want in (
+        ("laser_reflectivity", r_e0 + r_srs),
+        ("laser_transmissivity", 1.0 - r_e0 - r_srs - absorbed),
+        ("laser_absorbed_frac", absorbed),
+        ("laser_reflectivity_naive", r_srs),
+        ("laser_absorbed_frac_epw", absorbed),
+        ("laser_absorbed_frac_epw_seg1of4", absorbed),
+        ("electron_energy_frac_final", absorbed),
+        ("laser_incident_flux_ratio", i_in),
+    ):
+        np.testing.assert_allclose(m[key], want, rtol=1e-12, err_msg=key)
+
+
+def test_prescribed_reflectivity_is_a_fraction_of_the_pump_x_flux():
+    """Prescribed pump at 30 deg: the pump's x-flux is 0.866 I0 and the Raman light leaving the entrance is
+    0.0866 I0, so laser_reflectivity = 0.10 (before the fix: 0.0866, divided by 1). Exact: rtol 1e-12."""
+    from adept._lpse2d_cpp.diagnostics import series_metrics
+
+    cfg = _budget_cfg(pump_depletion=False)
+    t = np.linspace(0.0, 4.0, 401)
+    i_in = np.cos(np.deg2rad(30.0))
+    series = _series(
+        t,
+        incident_pump_flux=i_in,
+        incident_flux=i_in,
+        reflected_flux=0.1 * i_in,
+        transmitted_flux=i_in,
+        backrefl_flux=0.0,
+    )
+    m = series_metrics(series, cfg)
+    np.testing.assert_allclose(m["laser_reflectivity"], 0.1, rtol=1e-12)
+    np.testing.assert_allclose(m["laser_reflectivity_seg2of4"], 0.1, rtol=1e-12)
+    assert "laser_transmissivity" not in m and "laser_absorbed_frac" not in m
+
+
+def test_fractions_follow_the_delivered_pulse():
+    """A pump that turns on at mid-run (incident power 0, then 1) with the EPW dissipating 0.3 of it: the
+    delivered fluence is half the nominal I0 t_end, so electron_energy_frac_final = 0.3 (the trapezoids of
+    both integrals share the step: exact, rtol 1e-12, fixed before the run; before the fix 0.15, the
+    fluence taken as I0 t_end); the quarters with the laser off log no fractions, the last one logs
+    laser_absorbed_frac_epw = 0.3."""
+    from adept._lpse2d_cpp.diagnostics import series_metrics
+
+    cfg = _budget_cfg(pump_depletion=True)
+    d = cfg["units"]["derived"]
+    i0_osiris = 0.5 * (d["E0_source"] * d["e_norm"]) ** 2
+    t = np.linspace(0.0, 4.0, 401)
+    on = (t >= 2.0).astype(float)
+    series = _series(
+        t,
+        incident_pump_flux=on,
+        incident_flux=on,
+        reflected_flux=0.0,
+        transmitted_flux=0.7 * on,
+        backrefl_flux=0.0,
+        epw_dissipation=0.3 * d["w0"] * i0_osiris * on,
+    )
+    m = series_metrics(series, cfg)
+    np.testing.assert_allclose(m["electron_energy_frac_final"], 0.3, rtol=1e-12)
+    np.testing.assert_allclose(m["laser_absorbed_frac_epw"], 0.3, rtol=1e-12)
+    np.testing.assert_allclose(m["laser_absorbed_frac"], 0.3, rtol=1e-12)
+    assert "laser_reflectivity_seg1of4" not in m and "laser_absorbed_frac_epw_seg2of4" not in m
