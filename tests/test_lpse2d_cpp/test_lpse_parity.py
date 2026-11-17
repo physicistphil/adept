@@ -421,6 +421,47 @@ def test_noise_max_wavenumber_masks_the_kick():
     assert np.all(kick[outside] == 0.0) and np.all(kick[~outside & (kx**2 + ky**2 > 0)] > 0.0)
 
 
+def test_noise_max_wavenumber_zeroes_the_potential_above_it():
+    """LPSE ``addNoiseToPotential_fft`` zeroes the potential wherever it adds no noise (k = 0, the
+    anti-aliased region, ``|k| >= lw.noise.maxWavenumber``; ZakharovSolver.cpp:2694, :2770) on every
+    LW step with noise on (physics review 2026-11-16, B7). One separate-solver step (uniform density,
+    no sources) from an O(1) potential filling the whole band: zero at and above the cap up to the
+    x-space round trip's round-off (atol 1e-12; the old code only withheld the noise there and left
+    O(1) modes), and below it the step without a cap (same seed, same phases; rtol 1e-12). With the
+    noise off the cap does nothing. As in LPSE the zeroing sits in the noise operation, so a density
+    gradient or a source can refill those modes later in the same step."""
+    from adept._lpse2d_cpp.core.epw import SpectralEPWSolver
+
+    def solver(noise=True, **source):
+        cfg = _noise_cfg("flat", noise_amplitude=1e-6, **source)
+        cfg["terms"]["epw"]["source"]["noise"] = noise
+        cfg["terms"]["epw"]["damping"] = {"collisions": False, "landau": False}
+        return cfg, SpectralEPWSolver(cfg)
+
+    cfg, capped = solver(noise_max_wavenumber=2.0)
+    _, free = solver()
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    rng = np.random.default_rng(3)
+    phi = jnp.asarray((rng.normal(size=(nx, ny)) + 1j * rng.normal(size=(nx, ny))) * cfg["grid"]["zero_mask"])
+    y = {"epw": phi, "E0": jnp.zeros((nx, ny, 2), dtype=jnp.complex128)}
+    derived = cfg["units"]["derived"]
+    k = np.sqrt(np.asarray(cfg["grid"]["kx"])[:, None] ** 2 + np.asarray(cfg["grid"]["ky"])[None, :] ** 2)
+    above = k >= 2.0 * derived["w0"] / derived["c"]
+    assert above.sum() > 10 and (~above).sum() > 10
+
+    out_capped, _ = capped.advance(0.0, y, None)
+    out_free, _ = free.advance(0.0, y, None)
+    out_capped, out_free = np.asarray(out_capped), np.asarray(out_free)
+    assert np.max(np.abs(out_capped[above])) < 1e-12
+    assert np.min(np.abs(out_free[above])) > 1e-3
+    np.testing.assert_allclose(out_capped[~above], out_free[~above], rtol=1e-12, atol=1e-12)
+
+    _, quiet = solver(noise=False, noise_max_wavenumber=2.0)
+    assert quiet.noise_band is None
+    out_quiet, _ = quiet.advance(0.0, y, None)
+    assert np.min(np.abs(np.asarray(out_quiet)[above])) > 1e-3
+
+
 # --------------------------------------------------- absorbers and band caps --
 
 

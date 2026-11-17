@@ -329,6 +329,8 @@ class SpectralEPWSolver:
       ``noise_kick_spectrum``)
     - ``terms.epw.max_wavenumber``: LPSE ``lw.maxWavenumber`` (units of k0), folded into
       the retained band by ``helpers.get_solver_quantities``
+    - ``terms.epw.source.noise_max_wavenumber``: LPSE ``lw.noise.maxWavenumber``; with the
+      noise on, the potential is zeroed at and above it in the noise operation of every step
     """
 
     def __init__(self, cfg: dict):
@@ -456,6 +458,19 @@ class SpectralEPWSolver:
             self.noise_kick = jnp.asarray(noise_kick_spectrum(cfg))
         else:
             self.noise_kick = None
+        # LPSE ZakharovSolver::addNoiseToPotential_fft (ZakharovSolver.cpp:2694, :2770) zeroes the
+        # potential wherever it adds no noise -- k = 0, the anti-aliased region and |k| at or above
+        # lw.noise.maxWavenumber -- on every LW step with noise on (amplitude > 0), so with the
+        # separate solver the noise cap is a hard cap on the EPW band (the combined solvers only
+        # withhold the noise there, as LPSE's combined paths)
+        self.noise_band = None
+        if self.noise_enabled and self.noise_amplitude > 0.0:
+            band = (np.asarray(self.low_pass_filter) > 0.0) & (np.asarray(self.k_sq) > 0.0)
+            max_k = source_cfg.get("noise_max_wavenumber")
+            if max_k is not None:
+                k0 = cfg["units"]["derived"]["w0"] / cfg["units"]["derived"]["c"]
+                band = band & (np.sqrt(np.asarray(self.k_sq)) < float(max_k) * k0)
+            self.noise_band = jnp.asarray(np.where(band, 1.0, 0.0))
 
         # Density gradient
         self.density_gradient_enabled = cfg["terms"]["epw"]["density_gradient"]
@@ -754,6 +769,10 @@ class SpectralEPWSolver:
         # ========================================================================
         # MATLAB line 1976: divE_k(isHighWavenumberMode) = 0
         phi_k = phi_k * self.low_pass_filter
+        if self.noise_band is not None:
+            # LPSE zeroes the potential outside the noise band in the noise loop; the kick is zero
+            # there, so zeroing before adding it is the same
+            phi_k = phi_k * self.noise_band
         book("dealias", self.energy(phi_k))
 
         # ========================================================================

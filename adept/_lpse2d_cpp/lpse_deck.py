@@ -607,7 +607,8 @@ def translate_parms(
         # isCalculated: LPSE's own calcNoiseAmp_K0 constant (ZakUnits.noise_amp_k0) with the
         # deck amplitude as multiplier; otherwise the plain amplitude converted to adept units
         "noise_calibrate": "lpse" if noise_calculated else False,
-        # LPSE lw.noise.maxWavenumber (units of k0, default unbounded; ParameterManager.cpp:767, 1498)
+        # LPSE lw.noise.maxWavenumber (units of k0, default unbounded; ParameterManager.cpp:767, 1498): no noise
+        # above it, and the separate solver zeroes the potential there every step (ZakharovSolver.cpp:2770)
         **({"noise_max_wavenumber": float(g("lw.noise.maxWavenumber"))} if "lw.noise.maxWavenumber" in parms else {}),
         "noise_amplitude": float(
             noise_amp_lpse if noise_calculated else noise_amp_lpse * zak.zak_per_um * zak.potential_zak_to_adept
