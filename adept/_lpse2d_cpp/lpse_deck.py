@@ -1139,6 +1139,12 @@ def translate_parms(
             b = (list(b) + [0.0, 0.0, 0.0])[:3]
             # B_z alone keeps the (p_x, p_y) tracker; any in-plane component adds p_z (plan 2 F.4)
             hpe["magnetic_field"] = b if any(abs(v) > 0 for v in b[:2]) else b[2]
+            if any(abs(v) > 0 for v in b):
+                report["notes"].append(
+                    "hpe.magneticField: LPSE's tracker turns its electrons with the positive-charge sign of v x B "
+                    "(ElectronTracker.cu:1731-1739); adept uses the electron's, so they gyrate the other way for "
+                    "this B (negate it to reproduce LPSE)"
+                )
         # LPSE hpe.gammaLimit.{damping, growth} are ZAK rates, default 1e6 -- effectively no limit
         # (ElectronTracker.cu:3038-3043); converted to 1/ps
         hpe["gamma_limit_damping"] = float(float(g("hpe.gammaLimit.damping", "1e6")) * zak.zak_per_ps)

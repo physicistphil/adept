@@ -981,6 +981,51 @@ def test_in_plane_magnetic_field_rotates_momentum_into_pz():
     assert np.all(np.abs(np.asarray(x_new) - np.asarray(x)) < 1e-12)
 
 
+def test_magnetic_rotation_has_the_electron_sense_not_lpses():
+    """The tracked particles are electrons: du/dt = -(e/m_e) (u/gamma) x B. Reference: RK4 of that
+    equation over one EPW step (4000 steps) for an oblique B and a 3-momentum, rtol 1e-9; the
+    exact rotation of the push (|omega_c| dt / gamma = 0.4 rad here) must land on it. LPSE's tracker
+    kicks u by +dt (e/m_e) v x B (ElectronTracker.cu:1731-1739, CPU copy :4274-4280), the sign of a
+    positive charge, while its electric push uses q/m = -qOverMe (:3362): transcribed, its rate is
+    exactly opposite (physics review 2026-11-16, B21; kept as an intentional departure)."""
+    from adept._lpse2d_cpp.core.hpe import HybridParticleEvolution
+
+    b_hat = np.array([0.6, -0.8, 1.5]) / np.linalg.norm([0.6, -0.8, 1.5])
+    u0 = np.array([20.0, -10.0, 15.0])  # um/ps
+    probe = HybridParticleEvolution(_make_cfg_2d({"n_particles": 8, "magnetic_field": list(b_hat)}))
+    c = probe.c
+    gamma = np.sqrt(1.0 + np.sum(u0**2) / c**2)
+    b_vec = b_hat * 0.4 * gamma / (0.175882 * probe.dt)  # tesla: |omega_c| dt / gamma = 0.4
+    cfg = _make_cfg_2d({"n_particles": 8, "magnetic_field": list(b_vec)})
+    hpe = HybridParticleEvolution(cfg)
+    assert hpe.u_dim == 3
+    n = hpe.n_p
+    x = jnp.full((n,), 0.5 * (hpe.xmin + hpe.xmax))
+    y = jnp.full((n,), 0.5 * (hpe.ymin + hpe.ymax))
+    u = jnp.asarray(np.tile(u0, (n, 1)))
+    zero_field = jnp.zeros((hpe.nx_f, hpe.ny_f, 2), dtype=jnp.complex128)
+    _, _, u_new, *_ = hpe.push_2d(x, y, u, zero_field, 0.0)
+
+    omega = 0.175882 * b_vec  # e B / m_e, rad/ps
+
+    def rate(w):
+        return -np.cross(w / np.sqrt(1.0 + np.sum(w**2) / c**2), omega)
+
+    w, n_rk = u0.copy(), 4000
+    h = hpe.dt / n_rk
+    for _ in range(n_rk):
+        k1 = rate(w)
+        k2 = rate(w + 0.5 * h * k1)
+        k3 = rate(w + 0.5 * h * k2)
+        k4 = rate(w + h * k3)
+        w = w + h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    np.testing.assert_allclose(np.asarray(u_new), np.tile(w, (n, 1)), rtol=1e-9, atol=1e-9 * np.linalg.norm(u0))
+
+    # LPSE: u += dt * qOverMe_SI * (vel x B) with qOverMe_SI = +1.7588e11 C/kg -> +0.17588 rad/ps/T
+    lpse_rate = 0.17588 * np.cross(u0 / gamma, b_vec)
+    np.testing.assert_allclose(lpse_rate, -rate(u0) * 0.17588 / 0.175882, rtol=1e-12)
+
+
 def test_out_of_plane_field_keeps_the_two_momentum_tracker():
     """``[0, 0, B_z]`` is the float form ``B_z`` bit for bit, with (p_x, p_y) particles."""
     from adept._lpse2d_cpp.core.hpe import HybridParticleEvolution, load_particles
@@ -1023,6 +1068,8 @@ def test_translator_maps_the_full_magnetic_field_vector():
     cfg, report = translate_parms({**base, "hpe.magneticField": "1.5 0 3"}, run="bx")
     assert cfg["terms"]["hpe"]["magnetic_field"] == [1.5, 0.0, 3.0]
     assert not any("magneticField" in u for u in report["unsupported"])
+    # the gyration-sense departure (physics review 2026-11-16, B21) is noted, the vector passed unchanged
+    assert any(n.startswith("hpe.magneticField") and "other way" in n for n in report["notes"])
 
 
 @pytest.mark.parametrize("make", ["_make_cfg", "_make_cfg_2d"])
