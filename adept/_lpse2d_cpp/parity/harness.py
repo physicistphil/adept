@@ -241,7 +241,8 @@ def translate_deck(
 @dataclass
 class DeckRun:
     """What ``run_deck`` hands back: the config actually run, the translator report, the
-    MLflow run id and the post-processing datasets."""
+    MLflow run id and the post-processing datasets (``fields`` is None for a resumed segment with no
+    field save left, as ``post_process`` returns it)."""
 
     deck: str
     cfg: dict
@@ -262,7 +263,7 @@ def run_deck(
     experiment: str = "lpse-parity",
 ) -> DeckRun:
     """Run a translated deck through ``ergoExo``; optionally save ``config.yaml``,
-    ``series.nc``, ``fields.nc`` and ``metrics.npy`` under ``out_dir``."""
+    ``series.nc``, ``fields.nc`` (when the run saved fields) and ``metrics.npy`` under ``out_dir``."""
     import jax
     import yaml
 
@@ -285,7 +286,8 @@ def run_deck(
     _, ppo, run_id = exo(modules)
     if out_dir is not None:
         ppo["series"].to_netcdf(out_dir / "series.nc", engine="h5netcdf", invalid_netcdf=True)
-        ppo["x"].to_netcdf(out_dir / "fields.nc", engine="h5netcdf", invalid_netcdf=True)
+        if ppo["x"] is not None:  # a restart past the last scheduled field save has none
+            ppo["x"].to_netcdf(out_dir / "fields.nc", engine="h5netcdf", invalid_netcdf=True)
         np.save(out_dir / "metrics.npy", ppo["metrics"], allow_pickle=True)
     return DeckRun(deck, cfg, report, run_id, ppo["series"], ppo["x"], ppo["metrics"], out_dir)
 

@@ -412,6 +412,45 @@ def test_verify_fails_when_a_recomputed_metric_is_non_finite(monkeypatch, tmp_pa
     assert cli.cmd_verify(args) == 0
 
 
+def test_verify_fails_on_an_empty_baseline(capsys):
+    """No stored baseline metric to compare is not a reproduction: FAIL, exit 1 (PR #387 review: an
+    empty selection printed PASS without comparing anything)."""
+    from adept._lpse2d_cpp.parity import __main__ as cli
+
+    assert cli._verify_report({}, {"epw_energy_growth_0.3-0.9": 4.0}, 1e-9, "empty") == 1
+    assert "FAIL" in capsys.readouterr().out
+    assert cli._verify_report({"a": 1.0}, {"a": 1.0}, 1e-9, "one") == 0
+
+
+def test_run_deck_exports_a_segment_without_field_saves(monkeypatch, tmp_path):
+    """A resumed segment past its last scheduled field save post-processes to x = None; run_deck still
+    writes config.yaml, series.nc and metrics.npy, skips fields.nc and returns the run (PR #378 review:
+    it raised AttributeError after the simulation)."""
+    import jax
+    import xarray as xr
+
+    import adept
+    from adept._lpse2d_cpp.parity import harness
+
+    jax.config.update("jax_enable_x64", True)
+    series = xr.Dataset({"epw_energy": ("t (ps)", np.ones(3))}, coords={"t (ps)": np.arange(3.0)})
+    ppo = {"series": series, "x": None, "k": None, "metrics": {"m": 1.0}}
+
+    class FakeExo:
+        def setup(self, cfg):
+            return {}
+
+        def __call__(self, modules):
+            return None, ppo, "run-1"
+
+    monkeypatch.setattr(harness, "translate_deck", lambda *a, **k: ({"mlflow": {"run": "seg2"}}, {}))
+    monkeypatch.setattr(adept, "ergoExo", FakeExo)
+    out = harness.run_deck("unused.parms", out_dir=tmp_path)
+    assert out.fields is None and out.metrics == {"m": 1.0} and out.run_id == "run-1"
+    assert (tmp_path / "series.nc").exists() and (tmp_path / "metrics.npy").exists()
+    assert (tmp_path / "config.yaml").exists() and not (tmp_path / "fields.nc").exists()
+
+
 def _fake_archive(layout):
     """A stand-in for reference.download_run_artifacts over an archive whose reference metrics sit at
     ``lpse_reference/<layout>``: a request for that file writes it under ``dest`` (a single file lands

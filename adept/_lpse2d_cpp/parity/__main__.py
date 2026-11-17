@@ -145,9 +145,15 @@ def _download_reference_metrics(run_id: str, ref_dir: Path) -> Path:
 
 
 def _verify_report(stored: dict, computed: dict, rtol: float, label: str) -> int:
-    """Print the stored-vs-recomputed comparison; 0 if every stored metric is recomputed, finite on
-    both sides and within ``rtol``, else 1. Failures are counted per metric, so a non-finite value
-    (whose relative difference is NaN) cannot hide behind a finite running maximum."""
+    """Print the stored-vs-recomputed comparison; 0 if there is at least one stored metric and
+    every stored metric is recomputed, finite on both sides and within ``rtol``, else 1. Failures are
+    counted per metric, so a non-finite value (whose relative difference is NaN) cannot hide behind a
+    finite running maximum."""
+    if not stored:
+        # nothing to compare is not a reproduction: an archive without the selected baseline metrics
+        print(f"{label}: no stored baseline metrics to compare against")
+        print("FAIL")
+        return 1
     worst = 0.0
     missing, failed = [], []
     for k, v in sorted(stored.items()):
