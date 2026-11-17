@@ -121,24 +121,24 @@ def write_units(cfg: dict) -> dict:
     ne_cc = nc * envelopeDensity * 1e4**3
     Te_eV = Te * 1000
 
-    coulomb_log = (
-        23.0 - np.log(np.sqrt(ne_cc) * Z / Te_eV**1.5) if Te_eV < 10 * Z**2 else 24.0 - np.log(np.sqrt(ne_cc) / Te_eV)
-    )
     fract = 1
     Zbar = Z * fract
     ni = fract * ne_cc / Zbar
 
-    # logLambda_ei = np.zeros(len(Z))
-    # for iZ in range(len(Z)):
     if cfg["terms"]["epw"]["damping"]["collisions"]:
         if isinstance(cfg["terms"]["epw"]["damping"]["collisions"], bool):
-            if Te_eV < 0.01 * Z**2:
-                logLambda_ei = 22.8487 - np.log(np.sqrt(ne_cc) * Z / (Te * 1000) ** (3 / 2))
-            elif Te_eV > 0.01 * Z**2:
-                logLambda_ei = 24 - np.log(np.sqrt(ne_cc) / (Te * 1000))
+            # electron-ion Coulomb logarithm at the envelope density, LPSE ParameterManager.cpp:1471-1480
+            # (NRL formulary): the low-temperature branch below Te = 10 Z^2 eV, i.e. Te_keV < 0.01 Z^2,
+            # and LPSE's floor max(2, lnLambda)
+            if Te < 0.01 * Z**2:
+                logLambda_ei = 22.8487 - np.log(np.sqrt(ne_cc) * Z / Te_eV**1.5)
+            else:
+                logLambda_ei = 24.0 - np.log(np.sqrt(ne_cc) / Te_eV)
+            logLambda_ei = max(2.0, float(logLambda_ei))
 
-            e_sq = 510.9896 * 2.8179e-13
-            this_me = 510.9896 / 2.99792458e10**2
+            # m_e c^2 = 510.99895 keV (LPSE MeC2_kev, CODATA)
+            e_sq = 510.99895 * 2.8179e-13
+            this_me = 510.99895 / 2.99792458e10**2
             nu_coll = float(
                 (4 * np.sqrt(2 * np.pi) / 3 * e_sq**2 / np.sqrt(this_me) * Z**2 * ni * logLambda_ei / Te**1.5)
                 / 2

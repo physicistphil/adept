@@ -463,7 +463,7 @@ Each EPW step (`grid.dt`) follows LPSE's order (`ZakharovSolver::evolve`): the i
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `collisions` | bool or float | Collisional damping. `true` computes from plasma parameters, or specify rate directly |
+| `collisions` | bool or float | Collisional damping. `true` computes LPSE's electron-ion amplitude rate at the envelope density (`ParameterManager.cpp:1461-1487`): half of `nu_ei = (4 sqrt(2 pi)/3) e^4 Z^2 n_i lnLambda / (sqrt(m_e) T_e^1.5)` (the amplitude rate), with the NRL Coulomb logarithm `22.8487 - ln(sqrt(n_e) Z / T_eV^1.5)` below `T_e = 10 Z^2 eV` and `24 - ln(sqrt(n_e) / T_eV)` above (`n_e` in cm^-3), floored at 2; a number is the rate in 1/ps |
 | `landau` | bool | Include Landau damping |
 | `landau_form` | string | (default `relativistic`, LPSE's `isRelativistic` default) Static Landau rate. `matlab`: the prototype's `sqrt(pi/8) (1 + 1.5 x^2) wp^4/(k^3 vte^3) exp(-3/2 - 1/(2x^2))`, `x = k lambda_D`. `lpse`: the C++ `landauDamping_nonRel`, `sqrt(pi/8) (kde/k)^3 w_k exp(-w_k^2/(2 k^2 vte^2))` with `w_k = wp sqrt(1 + 3x^2)` -- identical exponent, prefactor `sqrt(1 + 3x^2)` vs `(1 + 1.5x^2)` (0.7% at x = 0.3, 3.8% at x = 0.5). `relativistic` (= `relativistic_2d`) / `relativistic_3d`: LPSE's Maxwell-Juettner Bessel-function rates (`landauDamping_rel_2D/3D`); modes with phase velocity above `c` are undamped |
 | `landau_lower_threshold` | float | (default `0`, 1/ps) LPSE `lw.landauDamping.lowerThreshold`: modes whose Landau rate is below it are treated as undamped (also in the thermal-noise balance) |
