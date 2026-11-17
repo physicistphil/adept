@@ -316,9 +316,12 @@ def _injector_rows(x: np.ndarray, x_inject: float, injector_width, dx: float, li
 def initial_perturbation_field(cfg: dict) -> np.ndarray:
     """The x-space plane wave of ``initial_perturbation`` on the grid, (nx, ny) complex, in this
     code's units of the target field (LPSE ``InitialPerturbation::create`` with its
-    ``scaleFactor``): the potential ``e phi / (m_e c^2)`` converts with ``1 / (e_norm x_norm)``,
-    a light field ``e E / (m_e w0 c)`` with ``1 / e_norm``. Coordinates are measured from the
-    box centre as in LPSE."""
+    ``scaleFactor``, ``Lpse.cpp:1819-1868``): the potential ``e phi / (m_e c^2)`` converts with
+    ``1 / (e_norm x_norm)``, the pump ``e E / (m_e w0 c)`` with ``1 / e_norm`` and the Raman light
+    ``e E / (m_e w_R c)``, normalised to its own carrier ``w_R`` (LPSE ``raman.Wo``: ``w1`` with the
+    separate EPW solver, ``wp0`` with the combined one), with ``(w_R / w0) / e_norm`` -- LPSE's
+    ``raman.Wo / raman.W0 / laserFieldNormalizationFactor``, the inverse of its Raman output
+    normalisation (``Metrics.cpp:283``). Coordinates are measured from the box centre as in LPSE."""
     ip = cfg["initial_perturbation"]
     grid, derived = cfg["grid"], cfg["units"]["derived"]
     x = np.asarray(grid["x"], dtype=np.float64)
@@ -341,8 +344,11 @@ def initial_perturbation_field(cfg: dict) -> np.ndarray:
             envelope = envelope * np.exp(-(np.abs((coord - offset) / (0.5 * size)) ** order))
     phase = np.exp(1j * (k_vec[0] * xc[:, None] + k_vec[1] * yc[None, :]))
     amplitude = float(ip.get("amplitude", 1.0))
-    if ip.get("field", "epw") == "epw":
+    field = ip.get("field", "epw")
+    if field == "epw":
         scale = 1.0 / (derived["e_norm"] * derived["x_norm"])  # e phi / (m_e c^2) -> potential
+    elif field == "E1":
+        scale = _raman_carrier(cfg) / derived["w0"] / derived["e_norm"]  # e E / (m_e w_R c) -> field
     else:
         scale = 1.0 / derived["e_norm"]  # e E / (m_e w0 c) -> field
     return amplitude * scale * envelope * phase

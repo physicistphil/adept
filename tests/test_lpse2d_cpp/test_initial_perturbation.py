@@ -113,7 +113,11 @@ def test_light_component_and_combined_field_seeding():
     e1 = np.asarray(module.state["E1"]).view(np.complex128)
     e0 = np.asarray(module.state["E0"]).view(np.complex128)
     assert e1.shape[-1] == 3
-    np.testing.assert_allclose(np.abs(e1[..., 2]), 1.0e-3 / module.cfg["units"]["derived"]["e_norm"], rtol=1e-12)
+    derived = module.cfg["units"]["derived"]
+    # LPSE's Raman seed is e E / (m_e w1 c) (test_light_seed_amplitudes_follow_lpse_normalisation)
+    np.testing.assert_allclose(
+        np.abs(e1[..., 2]), 1.0e-3 * derived["w1"] / derived["w0"] / derived["e_norm"], rtol=1e-12
+    )
     assert np.all(e1[..., :2] == 0.0) and np.all(e0 == 0.0)
     assert np.all(np.asarray(module.state["epw"]) == 0.0)
 
@@ -125,6 +129,32 @@ def test_light_component_and_combined_field_seeding():
     k = 2.0 * np.pi / 0.32
     np.testing.assert_allclose(e1[..., 0], -1j * k * wave, rtol=1e-9, atol=1e-9 * np.abs(wave).max() * k)
     assert np.abs(e1[..., 1]).max() < 1e-12 * np.abs(e1[..., 0]).max() and np.all(e1[..., 2] == 0.0)
+
+
+@pytest.mark.parametrize("solver", ["separate", "combined"])
+@pytest.mark.parametrize("field", ["E0", "E1"])
+def test_light_seed_amplitudes_follow_lpse_normalisation(field, solver):
+    """LPSE ``Lpse::createInitialPerturbation`` (``Lpse.cpp:1846-1868``) scales a pump seed by
+    ``1 / laserFieldNormalizationFactor`` (``e / (m_e c W0)`` per ZAK field unit, ``ParameterManager.cpp:1244``)
+    and a Raman seed by ``raman.Wo / raman.W0 / laserFieldNormalizationFactor``, ``raman.Wo = W0 - wpe``
+    for the separate solvers and ``wpe`` in combined mode (``LightSolver.cpp:2402-2418``): the amplitude is
+    ``e E / (m_e w0 c)`` for E0 and ``e E / (m_e w_R c)`` for E1. Transcribed here from the vacuum
+    wavelength and the envelope density (n_env = 0.2, so that w1 / w0 = 0.553 and wp0 / w0 = 0.447 differ);
+    rtol 1e-12."""
+    ip = {"field": field, "component": "y", "amplitude": 2.0e-3, "wavelength": "0.5um"}
+    cfg = _cfg(ip, solver=solver)
+    cfg["units"]["envelope density"] = 0.2
+    module = _module(cfg)
+    derived = module.cfg["units"]["derived"]
+    from astropy.units import Quantity
+
+    lambda_cm = Quantity(module.cfg["units"]["laser_wavelength"]).to("cm").value
+    w0 = 2.0 * np.pi * 2.99792458e10 / lambda_cm * 1e-12
+    np.testing.assert_allclose(derived["w0"], w0, rtol=1e-6)  # rad/ps
+    wpe_over_w0 = np.sqrt(0.2)
+    w_ratio = 1.0 if field == "E0" else (wpe_over_w0 if solver == "combined" else 1.0 - wpe_over_w0)
+    e_field = np.asarray(module.state[field]).view(np.complex128)[..., 1]
+    np.testing.assert_allclose(np.abs(e_field), 2.0e-3 * w_ratio / derived["e_norm"], rtol=1e-12)
 
 
 def test_envelope_and_oblique_direction():

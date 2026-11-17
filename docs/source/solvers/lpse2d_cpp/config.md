@@ -612,7 +612,7 @@ LPSE `initialPerturbation` (`InitialPerturbation.cpp`): a plane wave `A env(r) e
 |-------|------|-------------|
 | `field` | string | (default `epw`) `epw` seeds the EPW potential (k-space state; with `terms.epw.solver: combined` also the longitudinal part of `E1`, `-grad phi`); `E0` / `E1` seed one light-field `component` |
 | `component` | string | (default `y`) `x`, `y` or `z` for a light field |
-| `amplitude` | float | (default `1`) in LPSE's normalized output units: `e phi / (m_e c^2)` for the potential, `e E / (m_e w0 c)` for a light field (the translator passes `initialPerturbation.amplitude` through) |
+| `amplitude` | float | (default `1`) in LPSE's normalized output units: `e phi / (m_e c^2)` for the potential, `e E / (m_e w0 c)` for `E0`, `e E / (m_e w_R c)` for `E1`, normalised to the Raman light's own carrier `w_R` (`w1 = w0 - wp0`, or `wp0` with `terms.epw.solver: combined`; LPSE `raman.Wo / raman.W0 / laserFieldNormalizationFactor`, `Lpse.cpp:1848-1856`). The translator passes `initialPerturbation.amplitude` through |
 | `wavelength` | string | perturbation wavelength with unit; `K = 2 pi / wavelength` along `direction` |
 | `direction` | list | (default `[1, 0]`) in-plane direction of `K` (normalised) |
 | `envelope_size` | list | (optional) full width at 1/e per axis, with units; omit or `0um` for no envelope along that axis |

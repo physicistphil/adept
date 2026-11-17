@@ -596,7 +596,8 @@ class InitialPerturbationModel(BaseModel):
     field at t = 0 (``InitialPerturbation.cpp``). ``field: epw`` seeds the EPW potential (and
     the longitudinal part of the combined field), ``E0`` / ``E1`` one light-field
     ``component``. ``amplitude`` is in LPSE's normalized output units: ``e phi / (m_e c^2)``
-    for the potential, ``e E / (m_e w0 c)`` for a light field. ``K = 2 pi / wavelength``
+    for the potential, ``e E / (m_e w0 c)`` for ``E0`` and ``e E / (m_e w_R c)`` for ``E1``
+    (``w_R`` the Raman carrier: ``w1``, or ``wp0`` with the combined solver). ``K = 2 pi / wavelength``
     along ``direction``; ``envelope_size`` is the full width at 1/e per axis (omit or 0 for
     none) of the super-Gaussian ``exp(-|(r - offset) / (size/2)|^sg_order)`` about the box
     centre."""
