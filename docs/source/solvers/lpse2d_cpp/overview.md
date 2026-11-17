@@ -279,6 +279,27 @@ Hand-written configs that leave these unset behave differently from the first `_
 
 `terms.light.transverse_source` changed from `true` to `false` with the plan-2 work and is back to `true`.
 
+### Metrics whose definition changed (physics review 2026-11-16)
+
+These keep their names in the series and in MLflow but are computed differently from the 11-02 port and
+from the stack before the review fixes. **Runs on either side of the change cannot be compared metric for
+metric** (for example rerunning only some arms of a campaign): rerun every arm that is compared, or
+recompute the older values from their saved fields.
+
+| Metric | Before | Now | Size |
+|--------|--------|-----|------|
+| `epw_dissipation`, `epw_boundary_loss`, `electron_energy_frac_final`, `laser_absorbed_frac_epw` | EPW total-to-electric energy factor `2 (2 - n/n_env)` | `2 n_env / n`, the warm-fluid `w d(eps)/dw` at the carrier (review C3) | +8.5 % at `n/n_env` 0.72, +19 % at 0.6, 0 at `n_env` |
+| `laser_reflectivity`, `laser_transmissivity`, `laser_absorbed_frac` and their windowed forms (evolved pump) | over the second-half mean of the measured net pump flux | window by window over `incident_pump_flux`, the one-way power entering the box (review C1, C4) | with pump light leaving backwards (SBS, turning point) `R_SRS / (1 - R_E0)` becomes `R_SRS + R_E0`; pulse shapes |
+| `laser_reflectivity` (prescribed pump) | over 1 | over the pump's x-flux, `sum_b f_b cos(theta_b)` with the pulse shape (review C2) | 1 / cos(theta) for an oblique pump |
+| `laser_absorbed_frac_epw`, `electron_energy_frac_final` | over the nominal `I0` for the whole run | over the measured incident power (review C4) | about 1/0.98 at 8 cells per wavelength (the injector's launch deficit), on top of the C3 factor |
+| `laser_incident_flux_ratio` | net incident flux over nominal | delivered incident power over nominal | new meaning |
+| `incident_pump_flux` | -- | new series | -- |
+| `thomson_<i>_*` | sum of `phi_k` over a strict disc | window mean of LPSE's `rho_k = e k^2 phi_k / (m_e wp0^2)` over an inclusive disc (review B8) | different quantity and units |
+| `hpe_ld_multiplier` (`energy_conservation`) | balanced twice the Langmuir energy | balances `abs(E_env)^2 / (8 pi)` once (review A6) | about 2x in the linear regime |
+| QLE `gamma_L`, `vdf` (`landau_evolution`) | raw non-relativistic slope rate, node-sampled diffusion | calibrated rate, cell-deposited diffusion with the applied rate's coupling (review A9 and its bot round) | rate starts at the fluid rate; see `terms.qle` |
+| `nu_coll` (`terms.epw.damping.collisions: true`) | Coulomb-log branch on Te in eV, no floor | LPSE's branch (Te in keV), `max(2, ln Lambda)`, `m_e c^2` corrected (review B22) | only Te < 10 Z^2 eV or `ln Lambda` < 2, else 2.7e-5 |
+| `calc_threshold_intensity` | vacuum k0 | Simon et al. (1983) Eq. 39 with k0 at n_c/4 (review C7) | x1.155 |
+
 ### Translator restrictions
 
 The deck translator reports decks it cannot represent exactly: one light solver, FD stencil order,
