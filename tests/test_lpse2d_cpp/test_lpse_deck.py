@@ -755,3 +755,55 @@ def test_translator_seed_face_and_beam_format_follow_lpse(tmp_path):
     deck = _SEED_DECK.replace("raman.1.intensity = 1e12;\n", "raman.intensity = [1e12];\n")
     with pytest.raises(ValueError, match="abbreviated"):
         _translate_minimal(tmp_path, deck)
+
+
+_FD_IAW_DECK = (
+    "lw.enable = true;\nlw.spectral.dt = 0.002;\niaw.enable = true;\niaw.solver = fd;\niaw.landauDampingRate = 0.1;\n"
+    "iaw.collisionalDampingRate = 0.5;\n"
+)
+
+
+def test_translator_maps_the_fd_iaw_switches(tmp_path):
+    """Review 2026-11-16 B6: iaw.fd.include2ndOrderTemporalCorrection (default true, IawSolver.cpp:279-280) maps to
+    terms.iaw.temporal_correction; iaw.fd.laplacianOrder = 4 (:249-251), which adept's second-order fd
+    Laplacian cannot represent, and an explicit iaw.interpType = linear (:285-294) are reported; LPSE's linear
+    default with an fd laser is noted (adept interpolates spectrally, an intentional departure)."""
+    cfg, report = _translate_minimal(tmp_path, _FD_IAW_DECK)
+    assert cfg["terms"]["iaw"]["temporal_correction"] is True
+    assert not any("iaw." in u for u in report["unsupported"])
+    assert not any("interpType" in n for n in report["notes"])  # static laser: LPSE's spectral default
+    cfg, _ = _translate_minimal(tmp_path, _FD_IAW_DECK + "iaw.fd.include2ndOrderTemporalCorrection = false;\n")
+    assert cfg["terms"]["iaw"]["temporal_correction"] is False
+    _, report = _translate_minimal(tmp_path, _FD_IAW_DECK + "iaw.fd.laplacianOrder = 4;\n")
+    assert any("laplacianOrder = 4" in u for u in report["unsupported"])
+    _, report = _translate_minimal(tmp_path, _FD_IAW_DECK + "iaw.interpType = linear;\n")
+    assert any("interpType = linear" in u for u in report["unsupported"])
+    _, report = _translate_minimal(tmp_path, _FD_IAW_DECK + "laser.solver = fd;\n")
+    assert any("interpType = linear" in n and "default" in n for n in report["notes"])
+    assert not any("interpType" in u for u in report["unsupported"])
+    _, report = _translate_minimal(tmp_path, _FD_IAW_DECK + "laser.solver = fd;\niaw.fd.superSamples = 1;\n")
+    assert not any("interpType" in n for n in report["notes"])  # no interpolation without super-sampling
+
+
+def test_translator_fd_damping_enable_false_skips_the_kspace_step(tmp_path):
+    """B6: iaw.fd.damping.enable = false makes LPSE skip the fd k-space step -- Landau and collisional damping,
+    noise and band (IawSolver.cpp:2427); the translator writes a zero simplified rate, which throws adept's
+    identical switch (FDIonAcoustic.kspace_step), and turns the noise off. The spectral solver ignores the key."""
+    from adept._lpse2d_cpp.core.iaw import IonAcousticWave
+
+    cfg, report = _translate_minimal(
+        tmp_path,
+        _FD_IAW_DECK
+        + "iaw.fd.damping.enable = false;\niaw.fd.damping.isSimplified = false;\niaw.noise.enable = true;\n",
+    )
+    damping = cfg["terms"]["iaw"]["damping"]
+    assert damping["landau"] == 0.0 and damping["landau_form"] == "simplified"
+    assert cfg["terms"]["iaw"]["noise"] is False
+    assert any("fd.damping.enable = false" in n for n in report["notes"])
+    assert IonAcousticWave(_finish(cfg)).fd.kspace_step is False
+    cfg, report = _translate_minimal(
+        tmp_path,
+        _FD_IAW_DECK.replace("iaw.solver = fd;\n", "iaw.spectral.dt = 0.01;\n") + "iaw.fd.damping.enable = false;\n",
+    )
+    assert cfg["terms"]["iaw"]["damping"]["landau"] == 0.1
+    assert any("no effect" in n for n in report["notes"])

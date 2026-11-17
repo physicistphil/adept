@@ -1074,6 +1074,20 @@ def translate_parms(
         # (div v is d(Nelf)/dt) -> 1/ps. A non-positive A adds no noise (IawSolver.cpp:2553)
         iaw_noise_amplitude = float(g("iaw.noise.amplitude", "1"))
         iaw_noise = _bool(g("iaw.noise.enable")) and iaw_noise_amplitude > 0.0
+        # LPSE iaw.fd.damping.enable (default true, ParameterManager.cpp:914; read for both solvers, acting only on
+        # fd): false skips the fd k-space step -- Landau and collisional damping, noise and band -- as does a
+        # simplified rate <= 0 (IawSolver.cpp:2427-2428). adept's fd solver has the same switch (kspace_step),
+        # thrown by a zero simplified rate, so the deck's damping is translated as that
+        fd_damping_off = iaw_solver == "fd" and not _bool(g("iaw.fd.damping.enable"), True)
+        if fd_damping_off:
+            iaw_landau, iaw_form = 0.0, "simplified"
+            report["notes"].append(
+                "iaw.fd.damping.enable = false: LPSE's fd IAWs run without Landau or collisional damping and without "
+                "noise (IawSolver.cpp:2427); translated as a zero simplified Landau rate, which skips adept's "
+                "k-space step the same way"
+            )
+        elif iaw_solver != "fd" and not _bool(g("iaw.fd.damping.enable"), True):
+            report["notes"].append("iaw.fd.damping.enable = false has no effect on LPSE's spectral IAW solver")
         if iaw_noise and iaw_solver == "fd" and iaw_form == "simplified" and iaw_landau <= 0.0:
             # the fd k-space step, noise included, is skipped for a simplified rate <= 0 (IawSolver.cpp:2428)
             iaw_noise = False
@@ -1102,6 +1116,29 @@ def translate_parms(
             iaw["landau_update"] = int(float(g("iaw.fd.numStepsPerLandauDampingUpdate", "1")))
             if str(g("iaw.fd.advectionSolver", "ppm")).lower() not in ("ppm",):
                 report["notes"].append("iaw.fd.advectionSolver != ppm: adept's fd IAW solver advects with PPM")
+            # iaw.fd.include2ndOrderTemporalCorrection (default true, IawSolver.cpp:279-280)
+            iaw["temporal_correction"] = _bool(g("iaw.fd.include2ndOrderTemporalCorrection"), True)
+            # iaw.fd.laplacianOrder, 2 or 4 (IawSolver.cpp:249-251, getLaplacian of the density); adept's: 2
+            laplacian_order = int(float(g("iaw.fd.laplacianOrder", "2")))
+            if laplacian_order != 2:
+                report["unsupported"].append(
+                    f"iaw.fd.laplacianOrder = {laplacian_order}: adept's fd IAW Laplacian is second order"
+                )
+            # iaw.interpType (IawSolver.cpp:285-294): the drive's coarse-to-fine interpolation, LPSE's default linear
+            # with an fd laser and spectral otherwise; adept's is always spectral (FFT zero-padding, exact for the
+            # band-limited drive; see Departures from LPSE). Linear scales the in-band drive by cos^2(k dx / 4) per
+            # axis at superSamples 2 (SuperSampleGrid_1f1::copyCoarseToFine_linear)
+            default_interp = "spectral" if g("laser.solver", "static").lower() in ("static", "spectral") else "linear"
+            interp = str(g("iaw.interpType", default_interp)).lower()
+            if iaw["super_samples"] > 1 and interp == "linear":
+                message = (
+                    "iaw.interpType = linear: adept interpolates the IAW drive onto the fine grid spectrally (exact "
+                    "for the band-limited drive; LPSE's linear interpolation scales it by cos^2(k dx / 4) per axis)"
+                )
+                if "iaw.interpType" in parms:
+                    report["unsupported"].append(message)
+                else:
+                    report["notes"].append(message + " -- LPSE's default with laser.solver = fd")
         # iaw.velocityProfile.* (plan 2 I.2): the plasma-flow profile of the fd solver
         if _bool(g("iaw.velocityProfile.enable")):
             shape = str(g("iaw.velocityProfile.shape", "linear")).lower()
