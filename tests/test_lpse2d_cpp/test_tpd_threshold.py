@@ -20,6 +20,8 @@ import numpy as np
 import pytest
 from jax import devices
 
+from adept.lpse2d_cpp import calc_threshold_intensity
+
 LAMBDA_UM = 0.351
 L_UM = 200.0
 TE_KEV = 2.0
@@ -62,3 +64,15 @@ def test_tpd_threshold_brackets_simon():
     above = log10_growth_last_5ps(2.0 * i_th, "above-2x-simon")
     assert below < 0.5, f"0.5 x Simon threshold: EPW energy grew {below:.2f} decades in the last 5 ps"
     assert above > 2.0, f"2 x Simon threshold: EPW energy grew only {above:.2f} decades in the last 5 ps"
+
+
+@pytest.mark.parametrize("te_kev, l_um, lambda_um", [(2.0, 100.0, 0.351), (1.0, 1.0, 1.0), (3.5, 400.0, 0.351)])
+def test_threshold_intensity_is_simon_1983(te_kev, l_um, lambda_um):
+    """calc_threshold_intensity (Te in keV, Ln in um, w0 in rad/ps; returns units of 1e14 W/cm^2) is the
+    absolute TPD threshold of Simon et al., Phys. Fluids 26, 3107 (1983), whose practical form (below
+    Eq. 41) is L_um lambda_um I_14 / T_keV = 81.86. rtol 1e-2, fixed before the run: the paper's rounded
+    81.86 against Eq. 39 evaluated with CODATA constants differs by 0.6 %; the previous form, with the
+    vacuum k0 in place of the n_c/4 wavenumber, was 0.861 of it (physics review 2026-11-16, C7)."""
+    w0 = 2.0 * np.pi * 2.99792458e2 / lambda_um  # rad/ps, c in um/ps
+    simon = 81.86 * te_kev / (l_um * lambda_um)
+    np.testing.assert_allclose(calc_threshold_intensity(te_kev, l_um, w0), simon, rtol=1e-2)

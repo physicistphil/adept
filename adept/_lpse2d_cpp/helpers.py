@@ -185,22 +185,36 @@ def write_units(cfg: dict) -> dict:
 
 
 def calc_threshold_intensity(Te: float, Ln: float, w0: float) -> float:
+    """Absolute two-plasmon-decay threshold of a normally incident pump at the quarter-critical density.
+
+    Simon, Short, Williams & Dewandre, Phys. Fluids 26, 3107 (1983), Eq. (39) (large-beta theory):
+
+        (v0 / ve)^2 k0 L > 4.134
+
+    with ``v0 = e E0 / (m w0)`` for the pump field ``2 E0 cos(k0 x - w0 t)`` (half the peak quiver
+    velocity), ``ve = sqrt(T_e / m)``, ``k0 = (w0 / c) sqrt(3) / 2`` the pump wavenumber at ``n_c / 4``
+    and ``L`` the density scale length there. The intensity ``I = c (2 E0)^2 / (8 pi)`` follows. This
+    evaluates Eq. (39) with CODATA constants; the paper's practical form
+    ``L_um lambda_um I_14 / T_keV > 81.86`` is 0.6 % higher (its rounding).
+
+    :param Te: electron temperature (keV)
+    :param Ln: density scale length at n_c/4 (um)
+    :param w0: laser angular frequency (rad/ps)
+    :return: threshold intensity in units of 1e14 W/cm^2
     """
-    Calculate the TPD threshold intensity
+    c = 2.99792458e10  # cm/s
+    me_keV = 510.99895  # m_e c^2, keV
+    me_cgs = 9.1093837e-28  # g
+    e = 4.80320471e-10  # statC
 
-    :param Te:
-    :return: intensity
-    """
+    w0_s = w0 * 1.0e12  # rad/s
+    k0 = np.sqrt(3.0) / 2.0 * w0_s / c  # pump wavenumber at n_c/4, 1/cm
+    ve_sq = Te / me_keV * c**2
+    v0_sq = 4.134 * ve_sq / (k0 * Ln * 1.0e-4)
+    E0 = me_cgs * w0_s * np.sqrt(v0_sq) / e  # statV/cm; the peak pump field is 2 E0
+    I_cgs = c * (2.0 * E0) ** 2 / (8.0 * np.pi)  # erg / (s cm^2)
 
-    c = 2.99792458e10
-    me_keV = 510.998946  # keV/c^2
-    me_cgs = 9.10938291e-28
-    e = 4.8032068e-10
-
-    vte = np.sqrt(Te / me_keV) * c
-    I_threshold = 4 * 4.134 * 1 / (8 * np.pi) * (me_cgs * c / e) ** 2 * w0 * vte**2 / (Ln / 100) * 1e-7
-
-    return I_threshold
+    return I_cgs * 1.0e-7 / 1.0e14
 
 
 def range_restriction(x: np.ndarray, y: np.ndarray, window: dict) -> np.ndarray:
