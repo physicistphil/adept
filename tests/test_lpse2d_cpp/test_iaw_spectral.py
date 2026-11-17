@@ -316,7 +316,7 @@ def test_iaw_stride_applies_the_absorber_over_the_whole_iaw_step():
 def test_iaw_noise_lives_on_lpse_disc_and_zeroes_div_v_outside(solver):
     """Review 2026-11-16 B12: LPSE's IawSolver::addNoise, called by the spectral and fd paths alike, kicks
     div v on the disc |k| < (1 - antiAliasing.range) pi / h, k != 0 (IawSolver.cpp:2570-2582) and zeroes div v
-    outside it (:2601-2603); Nelf is left alone. adept kicked the whole retained rectangle, 4/pi = 1.27x the
+    outside it (:2606); Nelf is left alone. adept kicked the whole retained rectangle, 4/pi = 1.27x the
     modes with dx = dy. Exact mode sets (no tolerance): after one step from a state holding one disc mode and
     one corner mode (inside the rectangle, outside the disc) in both n and w, the kick covers exactly LPSE's
     disc, the corner's w is zero and its n is not."""

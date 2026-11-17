@@ -277,7 +277,10 @@ class FDIonAcoustic:
         band = coarse_band_on_fine_grid(coarse_filter, self.fnx, self.fny) & (fk_sq > 0.0)
         # k-space step every landau_update sub-steps over their combined length (LPSE
         # applyFFTDampingAndNoise(stepSize * numStepsPerLandauDampingUpdate)): w_k *= exp(-W_i dt)
-        # with W_i = 2 gamma_L + 2 nu_coll; modes outside the band are zeroed
+        # with W_i = 2 gamma_L + 2 nu_coll; modes outside the band are zeroed, k = 0 included. LPSE's fd step
+        # keeps W's k = 0 mode (damped at 2 nu) unless the noise is on (IawSolver.cpp:2467-2513, :2582), which
+        # matters only without forceAverageToZero, i.e. with thermal filamentation; its spectral path and
+        # adept's both zero it: a uniform heating drives no pressure gradient (Departures from LPSE)
         self.dt_damp = self.dt_sub * self.landau_update
         nu_coll = float(iaw.nu_coll)
         self.damping_factor = jnp.asarray(np.where(band, np.exp(-(2.0 * gamma + 2.0 * nu_coll) * self.dt_damp), 0.0))
@@ -292,7 +295,9 @@ class FDIonAcoustic:
         self.force_average = not bool(iaw.thermal_waves)
         # noise (LPSE IawSolver::addNoise) on the fine grid: A N_fine sqrt(exp(2 dt (gamma_L + nu)) - 1)
         # with a random phase on |k| < (1 - antiAliasing.range) pi / h_coarse, k != 0; the field
-        # outside that disc is zeroed when the noise is on
+        # outside that disc is zeroed when the noise is on. gamma_L is the applied rate (landau_form full or
+        # simplified), so the kick balances the damping it acts against; LPSE's addNoise always takes the
+        # simplified nu_io |k| (IawSolver.cpp:2585), off the full rate's balance (Departures from LPSE)
         self.noise = bool(iaw.noise_enabled) and self.kspace_step
         if self.noise:
             # LPSE's noise disc within the retained band (the coarse mask and terms.iaw.max_wavenumber),

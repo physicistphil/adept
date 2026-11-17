@@ -506,7 +506,7 @@ class IonAcousticWave:
                 self.thermal_filamentation_source(y["epw"], y["E0"], y["E1"], y["iaw_density"])
             )
         if self.noise_enabled:
-            # LPSE addNoise zeroes div v (not Nelf) outside the noise disc (IawSolver.cpp:2601-2603)
+            # LPSE addNoise zeroes div v (not Nelf) outside the noise disc (IawSolver.cpp:2606)
             w_new = (w_new + self.get_noise(t)) * self.noise_band
 
         n_new = n_new * self.filter

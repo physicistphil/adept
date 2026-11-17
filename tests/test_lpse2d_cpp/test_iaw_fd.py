@@ -599,3 +599,48 @@ def test_fd_noise_stays_inside_the_iaw_wavenumber_cap():
     above = fk >= k0
     assert w_k[above].max() <= 1e-9 * w_k.max()
     assert np.all(w_k[(fk > 0.0) & (fk < 0.9 * k0)] > 0.0)
+
+
+def test_fd_noise_balances_the_applied_full_landau_rate():
+    """Review 2026-11-16 B13, kept and documented: with landau_form full the fd k-space step damps div v at the
+    Krall-Trivelpiece rate (IawSolver.cpp:2477-2496), and adept's noise kick A N sqrt(exp(2 dt (gamma + nu)) - 1)
+    uses that same rate so the fluctuation-dissipation balance holds; LPSE's addNoise always takes the simplified
+    nu_io |k| (:2585). Pins adept's choice against a transcription of the C++ full rate (rtol 1e-12); the
+    simplified rate with landau = 0.1 would differ by a factor ~1.8 in amplitude here."""
+    from adept._lpse2d_cpp.core.iaw import IonAcousticWave
+    from adept._lpse2d_cpp.core.iaw_fd import coarse_band_on_fine_grid
+
+    cfg = _cfg_extra("fd", landau=0.1, collisions=0.5, noise=True, noise_amplitude=1e-6)
+    cfg["terms"]["iaw"]["damping"]["landau_form"] = "full"
+    fd = IonAcousticWave(cfg).fd
+    from astropy.units import Quantity
+
+    units = cfg["units"]
+    te = Quantity(units["reference electron temperature"]).to("keV").value
+    ti = Quantity(units["reference ion temperature"]).to("keV").value
+    z = float(units["ionization state"])
+    derived = units["derived"]
+    eta = 1.0 + 3.0 * ti / (z * te)
+    big_m = derived["mi"] / derived["me"] / (eta * z)
+    fk = 2.0 * np.pi * np.fft.fftfreq(fd.fnx, d=fd.h)
+    one_plus = 1.0 + fk**2 * derived["vte_sq"] / derived["wp0"] ** 2
+    w_r = np.sqrt(fk**2 * derived["cs"] ** 2 / one_plus)
+    w_i = (
+        w_r
+        * np.sqrt(np.pi / 8.0)
+        / np.sqrt(one_plus**3)
+        * (
+            np.sqrt((3.0 / (eta - 1.0)) ** 3) * np.exp(-0.5 * (3.0 / (eta - 1.0)) / one_plus)
+            + np.sqrt(1.0 / (eta * big_m))
+        )
+    )
+    expected = 1e-6 * fd.fnx * np.sqrt(np.expm1(2.0 * fd.dt_damp * (0.5 * w_i + 0.5)))
+    kick = np.asarray(fd.noise_kick)[:, 0]
+    inside = kick > 0.0
+    assert inside.sum() > 10
+    np.testing.assert_allclose(kick[inside], expected[inside], rtol=1e-12)
+    simplified = 1e-6 * fd.fnx * np.sqrt(np.expm1(2.0 * fd.dt_damp * (0.1 * derived["cs"] * np.abs(fk) + 0.5)))
+    assert np.max(kick[inside] / simplified[inside]) > 1.3
+    # the k = 0 mode of div v is outside the k-space band (B14: zeroed by every k-space step, kept by LPSE's fd step)
+    band = coarse_band_on_fine_grid(np.asarray(cfg["grid"]["iaw_low_pass_filter_grid"]), fd.fnx, fd.fny)
+    assert band[0, 0] and float(np.asarray(fd.damping_factor)[0, 0]) == 0.0
