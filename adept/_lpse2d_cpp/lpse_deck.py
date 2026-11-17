@@ -644,7 +644,10 @@ def translate_parms(
             "collisions": collisions,
             "landau": landau_on,
             "landau_form": "relativistic" if relativity else "lpse",
-            "landau_lower_threshold": float(g("lw.landauDamping.lowerThreshold", "0")),
+            # LPSE compares lw.landauDamping.lowerThreshold with its Landau rate in ZAK units as read
+            # (ParameterManager.cpp:788, no 1/ps conversion; LwSolver.cpp:1291, ZakharovSolver.cpp:2702,
+            # :2883), whatever its users guide says: a ZAK rate, here in 1/ps
+            "landau_lower_threshold": float(float(g("lw.landauDamping.lowerThreshold", "0")) * zak.zak_per_ps),
         },
         "density_gradient": True,
         "linear": True,
@@ -1005,22 +1008,33 @@ def translate_parms(
     iaw = None
     if _bool(g("iaw.enable")):
         iaw_solver = "spectral" if g("iaw.solver", "spectral").lower() == "spectral" else "fd"
+        iaw_landau = float(g("iaw.landauDampingRate", g("iaw.dampingRate", "0")))
+        iaw_collisions = float(g("iaw.collisionalDampingRate", "0"))
+        # the full Krall-Trivelpiece rate only on the fd path (iaw.fd.damping.isSimplified;
+        # the spectral step always uses nu |k|, ZakharovSolver.cpp:2083)
+        iaw_form = "full" if iaw_solver == "fd" and not _bool(g("iaw.fd.damping.isSimplified"), True) else "simplified"
+        # LPSE iaw.noise.{enable, amplitude} (ParameterManager.cpp:946-953, amplitude default 1): IawSolver::addNoise
+        # adds A N sqrt(exp(2 dt gamma) - 1) to the velocity divergence's k-space modes, so A is a ZAK rate
+        # (div v is d(Nelf)/dt) -> 1/ps. A non-positive A adds no noise (IawSolver.cpp:2553)
+        iaw_noise_amplitude = float(g("iaw.noise.amplitude", "1"))
+        iaw_noise = _bool(g("iaw.noise.enable")) and iaw_noise_amplitude > 0.0
+        if iaw_noise and iaw_solver == "fd" and iaw_form == "simplified" and iaw_landau <= 0.0:
+            # the fd k-space step, noise included, is skipped for a simplified rate <= 0 (IawSolver.cpp:2428)
+            iaw_noise = False
+            report["notes"].append("iaw.noise with fd IAWs and no Landau rate: LPSE adds no noise (IawSolver.cpp:2428)")
+        elif iaw_noise and iaw_landau + iaw_collisions <= 0.0:
+            raise ValueError(
+                "iaw.noise.enable needs iaw.landauDampingRate or iaw.collisionalDampingRate > 0 (LPSE refuses)"
+            )
         iaw = {
             "active": True,
             "solver": iaw_solver,
-            "damping": {
-                "landau": float(g("iaw.landauDampingRate", g("iaw.dampingRate", "0"))),
-                "collisions": float(g("iaw.collisionalDampingRate", "0")),
-                # the full Krall-Trivelpiece rate only on the fd path (iaw.fd.damping.isSimplified;
-                # the spectral step always uses nu |k|, ZakharovSolver.cpp:2083)
-                "landau_form": "full"
-                if iaw_solver == "fd" and not _bool(g("iaw.fd.damping.isSimplified"), True)
-                else "simplified",
-            },
+            "damping": {"landau": iaw_landau, "collisions": iaw_collisions, "landau_form": iaw_form},
             "max_density_perturbation": float(g("iaw.amplitudeClamp", "0.9")),
             # LPSE iaw.maxWavenumber (IawSolver.cpp:232-234; default none), separate from lw.maxWavenumber
             "max_wavenumber": float(parms["iaw.maxWavenumber"]) if "iaw.maxWavenumber" in parms else None,
-            "noise": _bool(g("iaw.noise.enable")),
+            "noise": iaw_noise,
+            **({"noise_amplitude": float(iaw_noise_amplitude * zak.zak_per_ps)} if iaw_noise else {}),
             # LPSE iaw.Labc (default 0: no IAW layer) at iaw.abc.maxDampingRate (default 100)
             "boundary_width": f"{widths['iaw'][0]}um",
             "boundary_max_rate": float(g("iaw.abc.maxDampingRate", "100")),

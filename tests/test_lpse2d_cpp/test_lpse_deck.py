@@ -586,3 +586,61 @@ def test_rectangular_dealias_keeps_lpse_index_range(n, aa, kept):
 
     m = np.rint(np.fft.fftfreq(n, d=1.0 / n)).astype(int)
     np.testing.assert_array_equal(np.sort(m[lpse_antialias_retained(n, aa)]), np.sort(kept))
+
+
+def _lpse_zak_per_ps(te=2.0, ti=1.0, z=1.0, mi_over_me=1836.0, n_env=0.25, wavelength_um=0.351):
+    """LPSE's zakUnitsPerPicosecond, transcribed from ParameterManager.cpp:1137-1163 independently of
+    ``ZakUnits``: ``1e-12 plasmaFrequency / wpe`` with ``plasmaFrequency = w0 sqrt(n_env)`` (``No = NoOverNc
+    Nc``, ``Nc = w0^2 me / (4 pi e^2)``) and the ZAK plasma frequency ``wpe = 1.5 M``,
+    ``M = (Mi/Me) / (eta Z)``, ``eta = 1 + 3 Ti / (Z Te)``. 2.436 for LPSE's default plasma."""
+    w0 = 2.0 * np.pi * 2.99792458e10 / (wavelength_um * 1.0e-4)
+    eta = 1.0 + 3.0 * ti / (z * te)
+    return 1.0e-12 * w0 * np.sqrt(n_env) / (1.5 * mi_over_me / (eta * z))
+
+
+def test_translator_converts_the_landau_lower_threshold_from_zak_units(tmp_path):
+    """Review 2026-11-16 B3: LPSE compares lw.landauDamping.lowerThreshold with its Landau rate in ZAK
+    units, unconverted (ParameterManager.cpp:788; LwSolver.cpp:1291, ZakharovSolver.cpp:2702, :2883), so
+    the deck value is a ZAK rate: 1/ps = value * zakUnitsPerPicosecond. Tolerance rel 1e-12 (the same
+    double-precision expression evaluated two ways); the old pass-through gave 1.5 (a factor 2.44 low)."""
+    base = "lw.enable = true;\nlw.spectral.dt = 0.002;\nlw.landauDamping.enable = true;\n"
+    cfg, _ = _translate_minimal(tmp_path, base + "lw.landauDamping.lowerThreshold = 1.5;\n")
+    zak_per_ps = _lpse_zak_per_ps()
+    assert zak_per_ps == pytest.approx(2.436, rel=1e-3)
+    assert cfg["terms"]["epw"]["damping"]["landau_lower_threshold"] == pytest.approx(1.5 * zak_per_ps, rel=1e-12)
+    cfg, _ = _translate_minimal(tmp_path, base + "physical.Te = 4;\nphysical.Z = 3.5;\nphysical.MiOverMe = 11926;\n")
+    assert cfg["terms"]["epw"]["damping"]["landau_lower_threshold"] == 0.0
+    cfg, _ = _translate_minimal(
+        tmp_path,
+        base + "physical.Te = 4;\nphysical.Z = 3.5;\nphysical.MiOverMe = 11926;\nlw.envelopeDensity = 0.1;\n"
+        "lw.landauDamping.lowerThreshold = 1.5;\n",
+    )
+    expected = 1.5 * _lpse_zak_per_ps(te=4.0, z=3.5, mi_over_me=11926.0, n_env=0.1)
+    assert cfg["terms"]["epw"]["damping"]["landau_lower_threshold"] == pytest.approx(expected, rel=1e-12)
+
+
+def test_translator_maps_the_iaw_noise_amplitude_from_zak_units(tmp_path):
+    """Review 2026-11-16 B1: LPSE's iaw.noise.amplitude (default 1, ParameterManager.cpp:950) multiplies the
+    kick ``A N sqrt(exp(2 dt gamma) - 1)`` on the velocity divergence's modes (IawSolver::addNoise), a ZAK
+    rate, so adept's terms.iaw.noise_amplitude (1/ps) = A * zakUnitsPerPicosecond. The old translator did not
+    write it (adept's default 1 /ps: 1/2.436 of LPSE's level here). Tolerance rel 1e-12. A non-positive
+    amplitude adds no noise (IawSolver.cpp:2553); noise without IAW damping is refused (:2557) except on the
+    fd path with a zero simplified rate, whose k-space step (noise included) LPSE skips (:2428)."""
+    base = (
+        "lw.enable = true;\nlw.spectral.dt = 0.002;\niaw.enable = true;\niaw.spectral.dt = 0.01;\n"
+        "iaw.landauDampingRate = 0.1;\niaw.noise.enable = true;\n"
+    )
+    zak_per_ps = _lpse_zak_per_ps()
+    cfg, _ = _translate_minimal(tmp_path, base)
+    assert cfg["terms"]["iaw"]["noise"] is True
+    assert cfg["terms"]["iaw"]["noise_amplitude"] == pytest.approx(1.0 * zak_per_ps, rel=1e-12)
+    cfg, _ = _translate_minimal(tmp_path, base + "iaw.noise.amplitude = 3e-4;\n")
+    assert cfg["terms"]["iaw"]["noise_amplitude"] == pytest.approx(3.0e-4 * zak_per_ps, rel=1e-12)
+    cfg, _ = _translate_minimal(tmp_path, base + "iaw.noise.amplitude = 0;\n")
+    assert cfg["terms"]["iaw"]["noise"] is False
+    no_damping = base.replace("iaw.landauDampingRate = 0.1;\n", "")
+    with pytest.raises(ValueError, match=r"iaw\.noise\.enable needs"):
+        _translate_minimal(tmp_path, no_damping)
+    cfg, report = _translate_minimal(tmp_path, no_damping + "iaw.solver = fd;\n")
+    assert cfg["terms"]["iaw"]["noise"] is False
+    assert any("adds no noise" in n for n in report["notes"])

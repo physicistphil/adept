@@ -248,6 +248,7 @@ The deck translator writes LPSE's value except where noted, so these matter for 
 | `terms.hpe.thermalization_probability` | follows the field boundaries | (1, 0, 0) (the translator writes (1, 0)) |
 | `terms.light.transverse_source` | `true`: without the projection the longitudinal part of `E1` accumulates the SRS source and pairs with the EPW in a spurious instability (41/ps against LPSE's 5.8/ps in the test_006 cross-check) | `false` (its reference decks set `true`) |
 | `terms.iaw.damping.landau` | none: required with `landau_form: simplified`, so that an IAW is never undamped by omission | 0 |
+| `terms.iaw.noise_amplitude` | 1 /ps | 1 in ZAK rate units, `zakUnitsPerPicosecond` /ps (2.44 /ps at Te 2 keV, Ti 1 keV, Z 1, 0.25 n_c) |
 
 ### Defaults changed against the 11-02 port
 
