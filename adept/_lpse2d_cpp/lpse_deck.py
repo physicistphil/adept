@@ -692,6 +692,36 @@ def translate_parms(
             }
             if "laser.evolution.resonanceAbsorption.time.stop" in parms:
                 ra["t_stop"] = f"{float(parms['laser.evolution.resonanceAbsorption.time.stop'])}ps"
+            # the RA masks span Labc + Loff from each wall (LightSolver.cpp:2530-2543), the warm term's
+            # ramp is sourceEdgeWidth wide (default 0, clipped to one cell, :1292, :2526)
+            if "laser.evolution.sourceEdgeWidth" in parms:
+                ra["edge_width"] = f"{float(parms['laser.evolution.sourceEdgeWidth'])}um"
+            ra_axes = ("x", "y") if boundary["y"] == "absorbing" else ("x",)
+            loff = {
+                f"{side}.{axis}": float(g(f"laser.evolution.Loff.{side}.{axis}", g("laser.evolution.Loff", "0")))
+                for side in ("min", "max")
+                for axis in ra_axes
+            }
+            if len(set(loff.values())) > 1:
+                report["unsupported"].append(
+                    f"laser.evolution.Loff per side / axis {loff}: adept's resonance-absorption masks use one "
+                    "offset (min.x)"
+                )
+            if loff["min.x"] > 0.0:
+                ra["boundary_offset"] = f"{loff['min.x']}um"
+            loff_y = float(g("laser.evolution.Loff.max.y", g("laser.evolution.Loff", "0"))) if ny > 1 else 0.0
+            if ny > 1 and boundary["y"] == "periodic" and loff_y > 0.0:
+                report["unsupported"].append(
+                    f"laser.evolution.Loff y = {loff_y} with periodic y: LPSE masks the resonance-absorption "
+                    "terms over it along y, adept leaves a periodic y axis unmasked"
+                )
+            elif ny > 1 and boundary["y"] == "periodic":
+                report["notes"].append(
+                    "laser.evolution.resonanceAbsorption with periodic y: LPSE's Landau-increment mask "
+                    "(beachRA.fullBeachX) is zero along an axis without Labc + Loff, so LPSE applies no RA "
+                    "Landau damping there and zeroes the warm term on the first and last y node; adept "
+                    "applies both unmasked in y (Departures from LPSE)"
+                )
             light["resonance_absorption"] = ra
     if raman_on and _bool(g("raman.evolution.resonanceAbsorption.enable")):
         report["unsupported"].append("raman.evolution.resonanceAbsorption (adept applies RA to the pump only)")

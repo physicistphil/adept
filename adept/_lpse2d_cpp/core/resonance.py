@@ -10,15 +10,22 @@ component there and is damped:
        dE/dt = C0 [ (div E) grad(n)/n - 3 grad(div E) ],   C0 = v_te^2 / (2 i w),
 
    the electron-pressure correction that gives the longitudinal part of E the Bohm-Gross
-   dispersion, masked off inside the absorbing layers with a quadratic ramp
-   (``Beach::halfBeachX``);
+   dispersion, masked off inside the absorbing layers and ``boundary_offset`` (LPSE ``Labc + Loff``)
+   with a quadratic ramp over ``edge_width`` (``Beach::halfBeachX``; default one cell, LPSE's
+   ``clip(sourceEdgeWidth, h)``), evaluated on LPSE's node coordinates (``lpse_beach_masks``). The
+   derivatives are the light solver's own stencils of ``terms.light.fd_order``: LPSE refuses RA at
+   ``solverOrder != 2`` (``LightSolver.cpp:925``; its ``gradDivEo`` is the second-order 9-point
+   stencil, ``:5163-5246``), at order 2 the two are the same stencil, and at 4 / 6 the term converges
+   at the stencil's order (see Departures from LPSE);
 2. Landau damping of the longitudinal part, in k-space,
 
        E_k -= T min(gamma_L(k), 1/T) k (k . E_k) / k^2,   T = landau_update dt,
 
    at the EPW Landau rate (the same table as the EPW step; LPSE builds it whenever RA is on,
-   whatever ``lw.landauDamping.enable``), masked with an s-curve over the absorbers
-   (``Beach::fullBeachX``); then, optionally, a radial low-pass filter on the field
+   whatever ``lw.landauDamping.enable``), masked with an s-curve over the absorbers and
+   ``boundary_offset`` (``Beach::fullBeachX``; along an axis without a layer -- periodic y -- LPSE's
+   zero-width s-curve makes that mask zero everywhere, which removes the damping; adept leaves such
+   an axis unmasked, see Departures from LPSE); then, optionally, a radial low-pass filter on the field
    (``Beach::fullRadialK``: 1 below ``filter_width * K_nyq - W``, an s-curve to 0 at
    ``filter_width * K_nyq``, ``W = K_nyq (1 - 1/sqrt(2))`` in 2-D; in quasi-1D, where ``W = 0``,
    a sharp passband ``|k| <= filter_width * K_nyq`` -- LPSE's zero-width s-curve there zeroes the
@@ -48,6 +55,27 @@ def quadratic_ramp(x, start, width):
     """LPSE ``Beach::leftRamp``: 0 for x <= start, 1 - (1 - y)^2 across ``width``, 1 beyond."""
     y = np.clip((np.asarray(x, dtype=np.float64) - start) / width, 0.0, 1.0) if width > 0 else np.ones_like(x)
     return 1.0 - (1.0 - y) ** 2
+
+
+def lpse_beach_masks(n: int, h: float, layer: float, edge_width: float) -> tuple[np.ndarray, np.ndarray]:
+    """LPSE's two resonance-absorption masks along one absorbing axis of ``n`` nodes, spacing ``h``
+    (``LightSolver.cpp:2523-2543``; ``Beach.h:146-216``), at LPSE's node coordinates ``x_i = i h`` on
+    ``[0, (n - 1) h]`` -- adept's cell ``i`` is LPSE's node ``i``. ``layer`` is ``Labc + Loff``.
+
+    - the warm term's ``beachSource.halfBeachX``: ``leftRamp(x, layer, W) rightRamp(x, Lmax - W, W)``
+      with ``Lmax = (n - 1) h - layer`` and ``W = clip(sourceEdgeWidth, h)`` (``edge_width``);
+    - the Landau increment's ``beachRA.fullBeachX``: ``sCurve(x, 0, layer) (1 - sCurve(x, (n - 1) h -
+      layer, layer))``. A zero ``layer`` gives 1 here (``1 - sCurve`` of a zero width would be 0 in
+      LPSE -- an axis without a layer is periodic and is not masked, see Departures from LPSE)."""
+    x = np.arange(n, dtype=np.float64) * h
+    size = (n - 1) * h
+    lmax = size - layer
+    warm = quadratic_ramp(x, layer, edge_width) * quadratic_ramp(-x, -lmax, edge_width)
+    if layer > 0.0:
+        landau = s_curve(x, 0.0, layer) * s_curve(-x, -size, layer)
+    else:
+        landau = np.ones(n)
+    return warm, landau
 
 
 def resonance_absorption_enabled(value) -> bool:
@@ -96,28 +124,23 @@ class ResonanceAbsorption:
         safe = np.where(density > 0.0, density, 1.0)
         self.grad_n_over_n = (jnp.asarray(gx / safe), jnp.asarray(gy / safe))
 
-        # masks (LPSE beachSource.halfBeachX / beachRA.fullBeachX): the absorbing layers are
-        # boundary_width wide from each x wall; the warm term ramps up quadratically over
-        # `edge_width` past the layer, the Landau increment follows an s-curve over the layer
-        # the pump's layer (laser.evolution.Labc)
+        # masks (LPSE beachSource.halfBeachX / beachRA.fullBeachX, lpse_beach_masks): the pump's
+        # absorbing layer (laser.evolution.Labc, terms.light.boundary_width) plus `boundary_offset`
+        # (laser.evolution.Loff) from each x wall; the warm term ramps up quadratically over
+        # `edge_width` (default one cell, LPSE's clip(sourceEdgeWidth = 0, h)) past it, the Landau
+        # increment follows an s-curve across it; y as x when y is absorbing, unmasked when periodic
         boundary_width = float(grid.get("light_boundary_width_um", _Q(grid["boundary_width"]).to("um").value))
-        edge_width = _Q(ra["edge_width"]).to("um").value if ra.get("edge_width") is not None else 2.0 * dx
+        offset = _Q(ra.get("boundary_offset", "0um")).to("um").value
+        if offset < 0.0:
+            raise ValueError("terms.light.resonance_absorption.boundary_offset must be >= 0")
+        layer = boundary_width + offset
+        edge_width = _Q(ra["edge_width"]).to("um").value if ra.get("edge_width") is not None else dx
         edge_width = max(edge_width, dx)
-        xmin, xmax = float(grid["xmin"]), float(grid["xmax"])
-        warm = quadratic_ramp(x, xmin + boundary_width, edge_width) * quadratic_ramp(
-            -x, -(xmax - boundary_width), edge_width
-        )
-        landau = s_curve(x, xmin, boundary_width) * s_curve(-x, -xmax, boundary_width)
+        warm, landau = lpse_beach_masks(nx, dx, layer, edge_width)
         if ny > 1 and str(cfg["terms"]["epw"]["boundary"].get("y", "periodic")) != "periodic":
-            ymin, ymax = float(grid["ymin"]), float(grid["ymax"])
-            warm = (
-                warm[:, None]
-                * (
-                    quadratic_ramp(y, ymin + boundary_width, edge_width)
-                    * quadratic_ramp(-y, -(ymax - boundary_width), edge_width)
-                )[None, :]
-            )
-            landau = landau[:, None] * (s_curve(y, ymin, boundary_width) * s_curve(-y, -ymax, boundary_width))[None, :]
+            warm_y, landau_y = lpse_beach_masks(ny, dy, layer, max(edge_width, dy))
+            warm = warm[:, None] * warm_y[None, :]
+            landau = landau[:, None] * landau_y[None, :]
         else:
             warm = np.repeat(warm[:, None], ny, axis=1)
             landau = np.repeat(landau[:, None], ny, axis=1)

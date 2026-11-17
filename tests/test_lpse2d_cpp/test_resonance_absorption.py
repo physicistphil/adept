@@ -247,3 +247,184 @@ def test_the_quasi_1d_resonance_filter_keeps_the_retained_band():
             out = np.asarray(ra.landau_step(jnp.asarray(E)))
             expected = E if abs(k) <= filter_width * k_nyq else 0.0 * E
             np.testing.assert_allclose(out, expected, rtol=1e-12, atol=1e-12 * 1.0e-3)
+
+
+# ------------------------------------------------- LPSE's RA masks (review 2026-11-16 B10 / B11) --
+
+
+def _lpse_s_curve(x, start, dx):
+    """Beach.h:146-163, transcribed: no beaching (1) for dx <= 0."""
+    if dx <= 0.0:
+        return np.ones_like(x)
+    y = (x - start) / dx
+    return np.where(x <= start, 0.0, np.where(x >= start + dx, 1.0, (3.0 - 2.0 * y) * y * y))
+
+
+def _lpse_left_ramp(x, start, dx):
+    if dx <= 0.0:
+        return np.ones_like(x)
+    y = (x - start) / dx
+    return np.where(x <= start, 0.0, np.where(x >= start + dx, 1.0, (2.0 - y) * y))
+
+
+def _lpse_right_ramp(x, start, dx):
+    if dx <= 0.0:
+        return np.ones_like(x)
+    y = (x - start) / dx
+    return np.where(x <= start, 1.0, np.where(x >= start + dx, 0.0, 1.0 - y * y))
+
+
+def _lpse_ra_beaches(n, h, labc, loff, source_edge_width):
+    """LightSolver.cpp:2523-2543 on the nodes x_i = i h of [0, gridSize = (n - 1) h]:
+    beachSource.halfBeachX (Lmin = Labc + Loff, Lmax = gridSize - (Labc + Loff), W = clip(sourceEdgeWidth, h))
+    and beachRA.fullBeachX (0, gridSize, Labc + Loff on each side), Beach.h:166-216."""
+    x = np.arange(n) * h
+    size = (n - 1) * h
+    w = max(source_edge_width, h)
+    lmin, lmax = labc + loff, size - (labc + loff)
+    half = _lpse_left_ramp(x, lmin, w) * _lpse_right_ramp(x, lmax - w, w)
+    full = _lpse_s_curve(x, 0.0, labc + loff) * (1.0 - _lpse_s_curve(x, size - (labc + loff), labc + loff))
+    return half, full
+
+
+@pytest.mark.parametrize(
+    ("edge_width", "offset", "y_boundary"), [(None, None, "periodic"), ("0.15um", "0.2um", "absorbing")]
+)
+def test_resonance_masks_are_lpse_beaches(edge_width, offset, y_boundary):
+    """The warm-term and Landau-increment masks are LPSE's beaches on its node coordinates: they span
+    Labc + Loff (``boundary_offset``) from each wall, the warm ramp is ``edge_width`` wide with LPSE's
+    default of one cell (``clip(sourceEdgeWidth = 0, h)``), and adept's cell i is LPSE's node i. Before
+    the fix the default ramp was 2 cells, Loff was ignored and the masks sat half a cell off. With
+    periodic y the masks are uniform in y (LPSE's y beaches there are a departure, see
+    test_resonance_absorption_departs_from_lpse_along_a_periodic_axis). rtol 1e-12."""
+    from adept._lpse2d_cpp.core.light import CoupledLight
+
+    ra = {}
+    if edge_width is not None:
+        ra["edge_width"] = edge_width
+    if offset is not None:
+        ra["boundary_offset"] = offset
+    cfg = _cfg(11.0, ramp=True, ra=ra, tmax=0.02)
+    cfg["terms"]["epw"]["boundary"]["y"] = y_boundary
+    cfg = _finish(cfg)
+    light = CoupledLight(cfg)
+    h = cfg["grid"]["dx"]
+    labc = cfg["grid"]["light_boundary_width_um"]
+    loff = 0.0 if offset is None else float(offset.rstrip("um"))
+    sew = 0.0 if edge_width is None else float(edge_width.rstrip("um"))
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    half_x, full_x = _lpse_ra_beaches(nx, h, labc, loff, sew)
+    if y_boundary == "absorbing":
+        half_y, full_y = _lpse_ra_beaches(ny, h, labc, loff, sew)
+    else:
+        half_y, full_y = np.ones(ny), np.ones(ny)
+    warm = np.asarray(light.resonance.warm_mask)[..., 0]
+    landau = np.asarray(light.resonance.landau_mask)[..., 0]
+    np.testing.assert_allclose(warm, half_x[:, None] * half_y[None, :], rtol=1e-12, atol=1e-15)
+    np.testing.assert_allclose(landau, full_x[:, None] * full_y[None, :], rtol=1e-12, atol=1e-15)
+    # one-cell default: on LPSE's nodes the ramp is a sharp step (Labc = 24 h here); a wider one has a skirt
+    assert np.any((warm > 0.0) & (warm < 1.0)) == (sew > h)
+
+
+def test_resonance_absorption_departs_from_lpse_along_a_periodic_axis():
+    """LPSE applies its RA beaches along every axis of a 2-D grid. Along a periodic y (Labc.y = Loff.y = 0)
+    beachRA.fullBeachX's ``1 - sCurve`` of zero width is 0 (Beach.h:146-168), so LPSE's Landau increment
+    is zero everywhere and resonance absorption loses its damping; beachSource zeroes the warm term on
+    the first and last y node. adept leaves a periodic axis unmasked (Departures from LPSE); the
+    translator says so in its notes."""
+    from adept._lpse2d_cpp.core.light import CoupledLight
+    from adept._lpse2d_cpp.lpse_deck import translate_parms
+
+    _, full_y = _lpse_ra_beaches(16, 0.1, 0.0, 0.0, 0.0)
+    assert np.all(full_y == 0.0)  # LPSE's mask along the periodic axis
+    cfg = _finish(_cfg(11.0, ramp=True, ra=True, tmax=0.02))
+    landau = np.asarray(CoupledLight(cfg).resonance.landau_mask)[..., 0]
+    assert np.all(landau == landau[:, :1]) and landau.max() == 1.0
+
+    parms = {
+        "grid.sizes": "10 4",
+        "grid.nodes": "100 40",
+        "simulation.time.end": "1",
+        "laser.enable": "true",
+        "laser.solver": "fd",
+        "laser.nBeams": "1",
+        "laser.1.intensity": "1e15",
+        "laser.evolution.Labc.min.x": "2",
+        "laser.evolution.Labc.max.x": "2",
+        "laser.evolution.resonanceAbsorption.enable": "true",
+    }
+    cfg_t, report = translate_parms(parms, run="ra")
+    assert "resonance_absorption" in cfg_t["terms"]["light"]
+    assert any("periodic y" in n and "resonanceAbsorption" in n for n in report["notes"])
+    parms_loff = {**parms, "laser.evolution.Loff.min.x": "0.3", "laser.evolution.Loff.max.x": "0.3"}
+    parms_loff["laser.evolution.sourceEdgeWidth"] = "0.25"
+    cfg_t, report = translate_parms(parms_loff, run="ra")
+    ra_t = cfg_t["terms"]["light"]["resonance_absorption"]
+    assert ra_t["boundary_offset"] == "0.3um" and ra_t["edge_width"] == "0.25um"
+    assert not any("Loff" in u for u in report["unsupported"])
+    cfg_t, report = translate_parms({**parms_loff, "laser.evolution.Loff.max.x": "0.5"}, run="ra")
+    assert any("laser.evolution.Loff per side" in u for u in report["unsupported"])
+
+
+@pytest.mark.parametrize("order", [2, 4, 6])
+def test_resonance_warm_term_converges_at_the_stencil_order(order):
+    """LPSE refuses resonance absorption at solverOrder != 2 (LightSolver.cpp:925): its gradDivEo is
+    the second-order 9-point stencil (:5163-5246). adept evaluates the warm term with the light solver's
+    own stencils of ``fd_order``. At order 2 that is LPSE's stencil (transcribed here, rtol 1e-12 on a
+    random field); at every order the term on a longitudinal plane wave in a uniform plasma,
+    ``-3 C0 grad(div E) = 3 C0 k^2 E``, converges at the stencil's order: halving k (|k| dx ~ 0.6 to
+    ~0.3, at ~30 deg) divides the error by 2^order within 25 % (fixed in advance)."""
+    from jax import numpy as jnp
+
+    from adept._lpse2d_cpp.core.epw import analytic_landau_rate
+    from adept._lpse2d_cpp.core.light import CoupledLight
+    from adept._lpse2d_cpp.core.resonance import ResonanceAbsorption
+
+    cfg = _cfg(11.0, ramp=False, ra=True, tmax=0.02)
+    cfg["terms"]["light"]["fd_order"] = order
+    cfg = _finish(cfg)
+    light = CoupledLight(cfg)
+    ra = ResonanceAbsorption(cfg, light, light.dt_l, np.asarray(analytic_landau_rate(cfg)))
+    ra.warm_mask = jnp.ones_like(ra.warm_mask)
+    x = np.asarray(cfg["grid"]["x"])
+    y = np.asarray(cfg["grid"]["y"])
+    h = cfg["grid"]["dx"]
+    nx, ny = x.size, y.size
+
+    errors = []
+    # a grid mode at ~30 deg with |k| dx ~ 0.3, and the mode at twice its k
+    mx = round(0.3 * np.cos(np.pi / 6) / h / (2 * np.pi / (nx * h)))
+    my = round(0.3 * np.sin(np.pi / 6) / h / (2 * np.pi / (ny * h)))
+    for scale in (2, 1):
+        kx, ky = 2 * np.pi * scale * mx / (nx * h), 2 * np.pi * scale * my / (ny * h)
+        k = np.hypot(kx, ky)
+        phase = np.exp(1j * (kx * x[:, None] + ky * y[None, :]))
+        E = np.stack([kx / k * phase, ky / k * phase], axis=-1)
+        got = np.asarray(ra.warm_term(jnp.asarray(E)))
+        want = 3.0 * ra.c0 * k**2 * E
+        errors.append(np.abs(got - want).max() / np.abs(want).max())
+    ratio = errors[0] / errors[1]
+    assert 0.75 * 2**order < ratio < 1.25 * 2**order, (errors, ratio)
+
+    if order == 2:
+        # LPSE: C0 [divergence(E) gradNoOverNo - 3 gradDivEo], second order (LightSolver.cpp:4640-4643)
+        rng = np.random.default_rng(5)
+        E = rng.normal(size=(nx, ny, 2)) + 1j * rng.normal(size=(nx, ny, 2))
+        ex, ey = E[..., 0], E[..., 1]
+
+        def sh(f, i, j):
+            return np.roll(f, (-i, -j), axis=(0, 1))
+
+        div = (sh(ex, 1, 0) - sh(ex, -1, 0)) / (2 * h) + (sh(ey, 0, 1) - sh(ey, 0, -1)) / (2 * h)
+        gdx = (
+            (sh(ex, 1, 0) - 2 * ex + sh(ex, -1, 0))
+            + (sh(ey, 1, 1) - sh(ey, -1, 1) - sh(ey, 1, -1) + sh(ey, -1, -1)) / 4
+        ) / h**2
+        gdy = (
+            (sh(ey, 0, 1) - 2 * ey + sh(ey, 0, -1))
+            + (sh(ex, 1, 1) - sh(ex, -1, 1) - sh(ex, 1, -1) + sh(ex, -1, -1)) / 4
+        ) / h**2
+        gx, gy = (np.asarray(g) for g in ra.grad_n_over_n)
+        want = np.stack([ra.c0 * (div * gx - 3 * gdx), ra.c0 * (div * gy - 3 * gdy)], axis=-1)
+        got = np.asarray(ra.warm_term(jnp.asarray(E)))
+        np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12 * np.abs(want).max())

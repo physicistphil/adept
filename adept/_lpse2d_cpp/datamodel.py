@@ -364,7 +364,8 @@ class LightModel(BaseModel):
     pml_denominator: float = 5.0
     # fd solver with pump_depletion: resonance absorption of the pump at the critical surface
     # (LPSE laser.evolution.resonanceAbsorption): true or {t_start, t_stop, filter: true,
-    # filter_width: 1.0, landau_update: 1, edge_width}; refused with the spectral solver as in LPSE
+    # filter_width: 1.0, landau_update: 1, edge_width (one cell), boundary_offset (LPSE Loff, 0um)};
+    # refused with the spectral solver as in LPSE
     resonance_absorption: bool | dict | None = None
     # fd solver: order of the central stencils (LPSE evolution.solverOrder 2 / 4 / 6); the
     # plane-wave injectors widen with it and the light dt limit tightens by 4/3 and 68/45
