@@ -44,6 +44,7 @@ from adept._lpse2d_cpp.core.light import (
     beam_envelopes_y,
     beam_transverse_wavenumbers,
     beam_wavenumbers,
+    shifted_swelling,
 )
 from adept._lpse2d_cpp.core.raman import RamanLight, transverse_part
 from adept._lpse2d_cpp.core.timeline import as_linear
@@ -58,7 +59,7 @@ def gaussian_injector_profile(x: np.ndarray, x_inject: float, width: float, dx: 
 
 def smooth_seed_source(t, seed_args: dict, *, w: float, c: float, x, y, x_inject, wpe_sq: float, profile) -> Array:
     """Smooth injector for the leftward Raman seed at carrier ``w``: the (nx, ny) source added
-    to ``E1_y``, launching ``A / eps^(1/4)`` (``eps = 1 - wpe^2/w^2`` at the injector) at the
+    to ``E1_y``, launching ``A / eps^(1/4)`` (``eps = 1 - wpe^2/(w (1 + dw))^2`` at the injector) at the
     local ``k = w/c sqrt((1 + dw)^2 - wpe^2/w^2)``. ``w`` is the Raman envelope frequency
     ``w1 = w0 - wp0`` of the separate solvers and ``wp0`` for the combined field (LPSE's
     ``W1 = wpe`` in combined mode, ``LightSolver.cpp:2404``)."""
@@ -70,7 +71,8 @@ def smooth_seed_source(t, seed_args: dict, *, w: float, c: float, x, y, x_inject
         envelope_y = jnp.ones_like(y)
     k1 = w / c * jnp.sqrt((1.0 + dw1) ** 2 - wpe_sq / w**2)
     v_g = c**2 * k1 / w
-    eps1 = 1.0 - wpe_sq / w**2
+    # the WKB amplitude at the seed's own frequency w (1 + dw) (LPSE injectorDensityCorrection)
+    eps1 = 1.0 - wpe_sq / (w * (1.0 + dw1)) ** 2
     amplitude = seed_args["amplitude"] / eps1**0.25 * turn_on
     carrier = jnp.exp(-1j * k1 * (x - x_inject) - 1j * w * dw1 * t)
     return (amplitude * v_g * profile * carrier)[:, None] * envelope_y[None, :]
@@ -304,6 +306,7 @@ class SmoothPumpInjector:
                 amp
                 * self.beam_envelope_y[b][None, :]
                 / (1.0 - n_src) ** 0.25
+                * shifted_swelling(n_src, delta_omega + dw_b)[:, None]
                 * jnp.sqrt(self.beam_fraction[b])
                 * jnp.exp(1j * beam_phase)
             )

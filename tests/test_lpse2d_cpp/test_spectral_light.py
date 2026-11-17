@@ -332,3 +332,101 @@ def test_transverse_source_removes_the_longitudinal_srs_source(solver):
         out[transverse_source] = float(jnp.max(jnp.abs(E1)))
     assert out[False] > 0.0
     assert out[True] < 1e-10 * out[False]
+
+
+def _lpse_injector_density_correction(n_over_nc_carrier, carrier_over_w0, dw):
+    """SchrodingerSolver3::injectorDensityCorrection (:2218-2224) of the density normalised to the
+    beamlet's own frequency, normalizedBackgroundDensity_lam0 (W0 / (Wo (1 + dw)))^2 (:2363), as the
+    injectors apply it (:2413): (1 - n_lam0 (W0 / (Wo (1 + dw)))^2)^(-1/4)."""
+    n_lam0 = n_over_nc_carrier * carrier_over_w0**2
+    return 1.0 / np.sqrt(np.sqrt(1.0 - n_lam0 / (carrier_over_w0 * (1.0 + dw)) ** 2))
+
+
+def test_shifted_colours_launch_at_their_own_wkb_amplitude():
+    """Every injector launches a colour at ``w (1 + dw)`` with the WKB amplitude of its own frequency,
+    ``(1 - n / (1 + dw)^2)^(-1/4)`` (LPSE's injectorDensityCorrection of the beamlet's normalised
+    density, transcribed above); before, every colour carried the carrier's ``(1 - n)^(-1/4)``, a
+    |E|^2 excess of ``n dw / (1 - n)`` over the physical swelling. Checked as the ratio of a colour at
+    dw = 0.05 to one at dw = 0 on the FD row and general pump injectors, the spectral pump injector, and
+    the FD and spectral seeds (the smooth sources also carry the x group velocity, ``k(dw) / k(0)``);
+    rtol 1e-12, fixed in advance."""
+    from adept._lpse2d_cpp.core.light import CoupledLight
+    from adept._lpse2d_cpp.core.raman import RamanLight
+    from adept._lpse2d_cpp.core.spectral_light import SpectralCoupledLight, SpectralRamanLight
+
+    dw, t = 0.05, 0.05
+
+    def ratio_expected(n, carrier_over_w0=1.0):
+        return _lpse_injector_density_correction(n, carrier_over_w0, dw) / _lpse_injector_density_correction(
+            n, carrier_over_w0, 0.0
+        )
+
+    def pump_cfg(solver, beams=None):
+        with open("tests/test_lpse2d_cpp/configs/srs.yaml") as fi:
+            raw = deepcopy(yaml.safe_load(fi))
+        raw["grid"].update({"xmax": "20um", "tmax": "10fs", "ymax": "0.02um", "ymin": "-0.02um"})
+        raw["terms"]["light"] = {"solver": solver, "pump_depletion": True}
+        raw["terms"]["epw"]["source"]["noise"] = False
+        raw["terms"]["epw"]["boundary"]["x"] = "absorbing"
+        if beams is not None:
+            raw["drivers"]["E0"]["beams"] = beams
+        return _finish(raw)
+
+    # FD row injector (one axial beam) and general injector (two axial beams)
+    for beams in (None, [{"intensity": 0.5, "angle": 0.0}, {"intensity": 0.5, "angle": 0.0}]):
+        cfg = pump_cfg("fd", beams)
+        light = CoupledLight(cfg)
+        assert light.fd_general_injector == (beams is not None)
+        ny = cfg["grid"]["ny"]
+        pump = {**cfg["drivers"]["E0"]["derived"], "intensities": jnp.ones((2, ny)), "phases": jnp.zeros((2, ny))}
+        if beams is None:
+            rows = [
+                light.calc_pump_source(
+                    t,
+                    {
+                        **pump,
+                        "delta_omega": jnp.array([d]),
+                        "intensities": jnp.ones((1, ny)),
+                        "phases": jnp.zeros((1, ny)),
+                    },
+                )
+                for d in (0.0, dw)
+            ]
+            for (_, a), (_, b) in zip(rows[0], rows[1], strict=True):
+                np.testing.assert_allclose(np.abs(b) / np.abs(a), ratio_expected(light.n_src), rtol=1e-12)
+        else:
+            pattern = np.asarray(light.pump_pattern({**pump, "delta_omega": jnp.array([0.0, dw])})[0])
+            got = np.abs(pattern[1, :, :, 1]) / np.abs(pattern[0, :, :, 1])
+            np.testing.assert_allclose(got, ratio_expected(light.beam_n_src[0]), rtol=1e-12)
+
+    # spectral pump injector: the source at the plane is A v_gx profile, v_gx = c^2 kx(dw) / w0
+    cfg = pump_cfg("spectral")
+    light = SpectralCoupledLight(cfg)
+    ny = cfg["grid"]["ny"]
+    pump = {**cfg["drivers"]["E0"]["derived"], "intensities": jnp.ones((1, ny)), "phases": jnp.zeros((1, ny))}
+    src = [
+        np.abs(np.asarray(light.calc_pump_source(t, {**pump, "delta_omega": jnp.array([d])}))[light.i0, :, 1])
+        for d in (0.0, dw)
+    ]
+    n = light.n_src
+    k_ratio = np.sqrt((1.0 + dw) ** 2 - n) / np.sqrt(1.0 - n)
+    np.testing.assert_allclose(src[1] / src[0], ratio_expected(n) * k_ratio, rtol=1e-12)
+
+    # Raman seeds, normalised to their carrier w1
+    for solver in ("fd", "spectral"):
+        cfg = _srs_cfg(solver, seed=True)
+        derived = cfg["units"]["derived"]
+        light = (SpectralRamanLight if solver == "spectral" else RamanLight)(cfg)
+        seed = cfg["drivers"]["E1"]["derived"]
+        n_r = light.wpe_sq_i1 / light.w1**2  # n / n_c(w1) at the seed plane
+        expected = ratio_expected(n_r, derived["w1"] / derived["w0"])
+        if solver == "fd":
+            rows = [light.calc_seed_source(t, {**seed, "delta_omega": d}) for d in (0.0, dw)]
+            for (_, a), (_, b) in zip(rows[0], rows[1], strict=True):
+                np.testing.assert_allclose(np.abs(b) / np.abs(a), expected, rtol=1e-12)
+        else:
+            src = [
+                np.abs(np.asarray(light.calc_seed_source(t, {**seed, "delta_omega": d}))[light.i1]) for d in (0.0, dw)
+            ]
+            k_ratio = np.sqrt((1.0 + dw) ** 2 - n_r) / np.sqrt(1.0 - n_r)
+            np.testing.assert_allclose(src[1] / src[0], expected * k_ratio, rtol=1e-12)

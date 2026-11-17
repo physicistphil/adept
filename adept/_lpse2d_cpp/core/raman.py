@@ -253,6 +253,7 @@ class RamanLight:
                     "or move the injector with drivers.E1.offset, or remove drivers.E1 to run noise-seeded."
                 )
             self.source_prefactor = self.c**2 / (2.0 * self.w_seed) / permittivity1**0.25 / self.dx**2
+            self.n_over_nc_seed_i1 = self.wpe_sq_i1 / self.w_seed**2  # n / n_c at the seed's carrier
             self.k1_inject = float(np.sqrt(self.w_seed**2 - self.wpe_sq_i1) / self.c)
             self.seed_enabled = True
         else:
@@ -378,7 +379,10 @@ class RamanLight:
         """
         dw1 = seed_args["delta_omega"]
         turn_on = 1.0 - jnp.exp(-((t / seed_args["turn_on_time"]) ** 2))
-        amp = self.source_prefactor * seed_args["amplitude"] * turn_on
+        # the WKB amplitude at the seed's own frequency (light.shifted_swelling; 1 for dw1 = 0)
+        n1 = self.n_over_nc_seed_i1
+        swell = ((1.0 - n1) / (1.0 - n1 / (1.0 + dw1) ** 2)) ** 0.25
+        amp = self.source_prefactor * seed_args["amplitude"] * turn_on * swell
 
         if seed_args["yw"] > 0:
             envelope_y = jnp.exp(-((self.y / (seed_args["yw"] / 2.0)) ** 4))

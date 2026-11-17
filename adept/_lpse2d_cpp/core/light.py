@@ -43,6 +43,17 @@ def beam_wavenumbers(w0: float, c: float, n_src, delta_omega) -> np.ndarray:
     return w0 / c * np.sqrt((1.0 + dw) ** 2 - n_src)
 
 
+def shifted_swelling(n_src, delta_omega):
+    """``(1 - n) / (1 - n / (1 + dw)^2)`` to the power 1/4: the factor by which the WKB amplitude
+    ``eps^(-1/4)`` of a wave at ``w (1 + dw)`` differs from the carrier's ``(1 - n)^(-1/4)``, ``n`` the
+    density in units of the carrier's critical density. LPSE scales every injected beamlet by
+    ``injectorDensityCorrection`` of the density normalised to the beamlet's own frequency,
+    ``(1 - n (W0 / (Wo (1 + dw)))^2)^(-1/4)`` (``SchrodingerSolver3.cpp:2363``, ``:2413``, ``:2218-2224``);
+    with a vacuum intensity ``I`` that is the physical swelling ``|E|^2 = I / sqrt(1 - wpe^2 / w^2)``
+    at the wave's frequency. Exactly 1 for ``dw = 0``."""
+    return ((1.0 - n_src) / (1.0 - n_src / (1.0 + delta_omega) ** 2)) ** 0.25
+
+
 def beam_transverse_wavenumbers(k0_beams, angles, dky: float, ny: int, snap: bool, width: float, order: float):
     """``ky = k0_b sin(angle_b)`` per beam, snapped to the periodic y grid (nearest multiple of ``dky``)
     for a beam without a transverse profile only -- LPSE's ``isPeriodicInjector = (beamWidth == 0 ||
@@ -115,7 +126,8 @@ class CoupledLight(RamanLight):
 
     The pump injector is the stencil's plane-wave injector (``RamanLight.injector_rows``:
     the two-point source at second order, wider at ``terms.light.fd_order`` 4 / 6) with
-    amplitude E0_source * sqrt(intensity) / eps^(1/4); the launched wave carries the
+    amplitude E0_source * sqrt(intensity) / eps^(1/4), ``eps = 1 - n / (1 + dw)^2`` at each colour's own
+    frequency (``shifted_swelling``); the launched wave carries the
     stencil's dispersion (``stencils.launched_amplitude_ratio``, a ~2 % deficit at 8 cells
     per wavelength at second order, 0.1 % at fourth), which the flux probes normalise out
     (tests/test_lpse2d_cpp/test_srs.py::test_pump_injector_calibration, test_fd_order.py).
@@ -481,7 +493,9 @@ class CoupledLight(RamanLight):
         # normalize to the *measured* incident flux, so this bias cancels there.
         k0 = self.w0 / self.c * jnp.sqrt((1.0 + delta_omega) ** 2 - self.n_src)  # (nc,)
 
-        amp = self.source_prefactor0 * self.E0_source * jnp.sqrt(intensities) * time_factor  # (nc, ny)
+        # each colour's WKB amplitude at its own frequency (source_prefactor0 carries (1 - n)^(-1/4))
+        swell = shifted_swelling(self.n_src, delta_omega)  # (nc,)
+        amp = self.source_prefactor0 * self.E0_source * jnp.sqrt(intensities) * time_factor * swell[:, None]
 
         color_phase = jnp.exp(
             -1j * self.w0 * delta_omega[:, None] * t + 1j * (phases + self.kap.phase(t, 0))
@@ -511,7 +525,10 @@ class CoupledLight(RamanLight):
             k0 = self.w0 / self.c * jnp.sqrt((1.0 + delta_omega + self.beam_delta_omega[b]) ** 2 - n_src)  # (nc,)
             kx = sign * jnp.sqrt(k0**2 - ky_b**2)  # (nc,)
             carrier = jnp.exp(1j * (kx[:, None, None] * (x - self.x[i_inject]) + ky_b * y))  # (nc, nx, ny)
+            # WKB amplitude of each colour at its own frequency (shifted_swelling)
+            swell = shifted_swelling(n_src, delta_omega + self.beam_delta_omega[b])  # (nc,)
             v = carrier * (amp_y * self.beam_envelope_y[b][None, :])[:, None, :] / (1.0 - n_src) ** 0.25
+            v = v * swell[:, None, None]
             k_mag = jnp.sqrt(kx[0] ** 2 + ky_b**2)
             cos_psi, sin_psi = np.cos(self.beam_polarization[b]), np.sin(self.beam_polarization[b])
             # LPSE rotateBeam: cos(psi) along the in-plane transverse direction of the first
