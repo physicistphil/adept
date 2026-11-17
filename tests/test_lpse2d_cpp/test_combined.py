@@ -868,7 +868,7 @@ def test_combined_dissipation_diagnostic_uses_the_combined_damping():
     the Landau rate in k-space plus the Raman absorption nu_R (n/n_env + dn f_R)^2 on the EPW energy
     density in x-space -- not the EPW collisions, which the combined solver ignores. Uniform box
     (n = 0.15 nc, n_env = 0.2, dn = 0.05), terms.light.raman_absorption 300/ps, EPW collisions on: with
-    Landau off, epw_dissipation = 2 (2 - n/n_env) L_c epw_energy, L_c = (1 - exp(-2 nu_R n_eff^2 dt)) / dt;
+    Landau off, epw_dissipation = (2 n_env/n) L_c epw_energy, L_c = (1 - exp(-2 nu_R n_eff^2 dt)) / dt;
     with Landau on, plus the k-space Landau term (Parseval). Exact identities, rtol 1e-12, fixed before
     the run. Before the fix the first case reported the EPW collisional loss."""
     from adept._lpse2d_cpp.core.epw import analytic_landau_rate
@@ -913,7 +913,7 @@ def test_combined_dissipation_diagnostic_uses_the_combined_damping():
     f_r = np.asarray(iaw_feedback_factor(cfg, "raman"))
     assert np.ptp(f_r) == 0.0
     loss_c = (1.0 - np.exp(-2.0 * 300.0 * (0.75 + 0.05 * float(f_r.flat[0])) ** 2 * dt)) / dt
-    factor = 2.0 * (2.0 - 0.75)
+    factor = 2.0 / 0.75
     assert float(out["epw_dissipation"]) == pytest.approx(factor * loss_c * float(out["epw_energy"]), rel=1e-12)
 
     cfg, phi_k, out = run(landau=True)
@@ -960,7 +960,7 @@ def test_combined_boundary_loss_diagnostic_uses_the_combined_layer():
     )
     kx, ky = np.asarray(grid["kx"]), np.asarray(grid["ky"])
     e_sq = np.abs(np.fft.ifft2(-1j * kx[:, None] * phi_k)) ** 2 + np.abs(np.fft.ifft2(-1j * ky[None, :] * phi_k)) ** 2
-    factor = 2.0 * (2.0 - np.asarray(grid["background_density"]) / cfg["units"]["envelope density"])
+    factor = 2.0 * cfg["units"]["envelope density"] / np.asarray(grid["background_density"])
     prefactor = 0.25 * grid["dx"] * d["x_norm"] * d["e_norm"] ** 2
     want = prefactor * np.sum(np.mean(factor * e_sq * (1.0 - b_c**2) / grid["dt"], axis=1))
     assert float(out["epw_boundary_loss"]) == pytest.approx(want, rel=1e-12)

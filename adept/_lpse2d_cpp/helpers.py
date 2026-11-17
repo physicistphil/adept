@@ -2470,6 +2470,30 @@ def make_light_spectrum_xarrays(cfg: dict, result, td: str) -> list[xr.Dataset]:
     return out
 
 
+def epw_total_energy_factor(cfg: dict) -> np.ndarray:
+    """Total (electric + kinetic + thermal) EPW energy per unit of electric energy, ``2 n_env / n``, on
+    the grid: the factor that turns the electric-energy loss of the EPW (``epw_energy``'s convention)
+    into the energy the damping hands to the electrons (``epw_dissipation``, ``epw_boundary_loss``).
+
+    For the warm-fluid EPW, ``eps = 1 - wp^2 / (w^2 - 3 k^2 vte^2)`` and the wave's total energy is
+    ``w d(eps)/dw = 2 w^2 / wp^2`` times its electric energy. The envelope EPW oscillates at its carrier
+    ``w = wp0``, where the solver's detuning puts the resonant modes at ``3 k^2 vte^2 = wp0^2 - wp^2``
+    (``wp^2 = wp0^2 n / n_env``), so the factor is ``2 wp0^2 / wp^2 = 2 n_env / n``. The SRS couplings
+    of the separate solver conserve exactly this energy: the EPW source carries ``n / n_env``, the light
+    couplings do not, and ``|E0|^2 + |E1|^2 + (n_env / n) |E_epw|^2`` is invariant (the light's total
+    energy is twice its electric energy). The TPD and combined couplings carry no density factor, so with
+    them the laser energy lost and ``epw_dissipation`` agree only at ``n = n_env``.
+
+    Raises where the density is not positive: an EPW has no energy without electrons."""
+    n = np.asarray(cfg["grid"]["background_density"], dtype=np.float64)
+    if not np.all(n > 0.0):
+        raise ValueError(
+            "the EPW energy diagnostics (epw_dissipation, epw_boundary_loss) need a positive density in every "
+            f"cell; the profile reaches {float(np.min(n)):.3g} n_c"
+        )
+    return 2.0 * float(cfg["units"]["envelope density"]) / n
+
+
 def get_default_save_func(cfg):
     from adept._lpse2d_cpp.core.epw import analytic_landau_rate
 
@@ -2525,14 +2549,9 @@ def get_default_save_func(cfg):
     energy_loss_factor = (1.0 - np.exp(-2.0 * gamma_total * dt)) / dt  # 1/ps, per k mode
     boundary_sq_loss = (1.0 - np.array(cfg["grid"]["absorbing_boundaries"]) ** 2) / dt  # 1/ps, per cell
 
-    # Total (electric + kinetic + thermal) EPW energy per unit of the electric energy
-    # that epw_energy counts. For the warm-fluid EPW, W_total/W_E = d(w*eps)/dw =
-    # 1 + wp^2/w^2 + 9 k^2 vte^2 wp^2 / w^4 evaluated at the envelope carrier w = wp0;
-    # the solver's detuning relation 3 k^2 vte^2 = wp0^2 - wp^2 with wp^2 = wp0^2 * n/n_env
-    # collapses it to the density-only factor 2*(2 - n/n_env). At n = n_env this is the
-    # familiar 2 (electric = kinetic); on the shipped ramps it reaches 2.56 at the
-    # low-density end, which the previously hard-coded 2 understated by ~28%.
-    energy_total_factor = 2.0 * (2.0 - np.array(cfg["grid"]["background_density"]) / cfg["units"]["envelope density"])
+    # total (electric + kinetic + thermal) EPW energy per unit of the electric energy that
+    # epw_energy counts, 2 n_env / n (epw_total_energy_factor)
+    energy_total_factor = epw_total_energy_factor(cfg)
 
     # terms.epw.solver: combined -- the EPW is the combined field's longitudinal part, damped by the
     # Landau rate in k-space and, with the whole field, by the Raman absorption nu_R (n/n_env + dn)^2
@@ -2704,7 +2723,7 @@ def get_default_save_func(cfg):
         # dissipation/boundary channels are TOTAL EPW-energy rates: epw_energy counts
         # only the electric part (the OSIRIS field-only convention), so the energy
         # actually handed to electrons -- and the budget sink -- carries the local
-        # total-to-electric factor energy_total_factor = 2*(2 - n/n_env)
+        # total-to-electric factor energy_total_factor = 2 n_env / n
         if dynamic_rate:
             # the applied rate is dynamic (HPE or QLE): read it from the state
             gamma_dyn = y["gamma_L"] + nu_coll_arr

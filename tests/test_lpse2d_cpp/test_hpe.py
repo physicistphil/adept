@@ -625,7 +625,7 @@ def test_dissipation_diagnostic_is_signed_with_allow_growth():
     """With terms.hpe.allow_growth the applied rate gamma_L + nu_coll can be negative (energy from the
     electrons to the EPW). The default save's epw_dissipation is then the signed sum
     prefactor * factor * sum_k L_k k^2 |phi_k|^2 / (nx ny^2), L_k = (1 - exp(-2 rate dt)) / dt (Parseval;
-    uniform box, so the total-to-electric factor 2 (2 - n/n_env) is a constant) -- before the fix
+    uniform box, so the total-to-electric factor 2 n_env/n is a constant) -- before the fix
     sqrt(L < 0) made it NaN (PR #387 review). With non-negative rates the series is bitwise the same
     with and without allow_growth. rtol 1e-12, fixed in advance."""
     from adept._lpse2d_cpp.core.hpe import load_particles
@@ -655,7 +655,7 @@ def test_dissipation_diagnostic_is_signed_with_allow_growth():
     rate = gamma + d.get("nu_coll", 0.0) * (k_sq > 0)
     assert np.any(rate * (np.abs(phi_k) > 0) < 0.0)
     loss = (1.0 - np.exp(-2.0 * rate * dt)) / dt
-    factor = 2.0 * (2.0 - np.asarray(grid["background_density"]) / cfg["units"]["envelope density"])
+    factor = 2.0 * cfg["units"]["envelope density"] / np.asarray(grid["background_density"])
     assert np.ptp(factor) == 0.0
     prefactor = 0.25 * grid["dx"] * d["x_norm"] * d["e_norm"] ** 2
     want = prefactor * float(factor.flat[0]) * np.sum(loss * k_sq * np.abs(phi_k) ** 2) / (nx * ny**2)

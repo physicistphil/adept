@@ -447,7 +447,7 @@ def test_dissipation_diagnostic_follows_the_evolved_qle_rate():
     zeros = jnp.zeros((nx, ny, 2), dtype=jnp.complex128).view(jnp.float64)
     save = get_default_save_func(cfg)["func"]
     k_sq = np.asarray(grid["kx"])[:, None] ** 2 + np.asarray(grid["ky"])[None, :] ** 2
-    factor = 2.0 * (2.0 - np.asarray(grid["background_density"]) / cfg["units"]["envelope density"])
+    factor = 2.0 * cfg["units"]["envelope density"] / np.asarray(grid["background_density"])
     assert np.ptp(factor) == 0.0
     prefactor = 0.25 * grid["dx"] * d["x_norm"] * d["e_norm"] ** 2
     for scale in (20.0, -35.0):

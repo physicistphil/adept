@@ -395,3 +395,85 @@ def test_poynting_refuses_a_single_point_x_save_grid():
     two = deepcopy(base)
     two["save"]["fields"].update({"x": {"dx": "6.4um"}, "y": {"dy": "0.2um"}, "poynting": True})
     assert _finish(two)["save"]["fields"]["x"]["ax"].size == 2
+
+
+# --- EPW total-to-electric energy factor (physics review 2026-11-16, C3) ---
+
+
+def _srs_box(density, envelope_density, pump_depletion=False):
+    with open("tests/test_lpse2d_cpp/configs/srs.yaml") as fi:
+        cfg = deepcopy(yaml.safe_load(fi))
+    cfg["units"]["envelope density"] = envelope_density
+    cfg["density"] = density
+    cfg["grid"].update({"xmax": "12.8um", "tmax": "10fs", "ymax": "0.02um", "ymin": "-0.02um", "dx": "0.1um"})
+    cfg["terms"]["epw"]["source"]["noise"] = False
+    if pump_depletion:
+        cfg["terms"]["light"] = {"pump_depletion": True}
+        cfg["terms"]["epw"]["boundary"]["x"] = "absorbing"
+    cfg["save"]["fields"].pop("x", None)
+    cfg["save"]["fields"].pop("y", None)
+    return _finish(cfg)
+
+
+def test_epw_total_energy_factor_is_w_deps_dw_at_the_carrier():
+    """epw_total_energy_factor is the warm-fluid w d(eps)/dw of the EPW at its carrier w = wp0, with
+    eps(w) = 1 - wp^2 / (w^2 - 3 k^2 vte^2), wp^2 = wp0^2 n/n_env and the resonant k of the solver's
+    detuning, 3 k^2 vte^2 = wp0^2 - wp^2. The reference differentiates eps numerically (central
+    difference, step 1e-5 wp0) on a ramp from 0.15 to 0.25 n_c with n_env = 0.25: rtol 1e-7, fixed before
+    the run (the difference's O(h^2) error is ~1e-10). The previous factor 2 (2 - n/n_env) was 16 % low
+    at the 0.15 end."""
+    from adept._lpse2d_cpp.helpers import epw_total_energy_factor
+
+    cfg = _srs_box({"basis": "linear", "gradient scale length": "30um", "min": 0.15, "max": 0.25}, 0.25)
+    n = np.asarray(cfg["grid"]["background_density"])
+    assert n.min() < 0.16 and n.max() <= 0.25
+    got = epw_total_energy_factor(cfg)
+    wp0 = cfg["units"]["derived"]["wp0"]
+    wp_sq = wp0**2 * n / 0.25
+    three_k2_v2 = wp0**2 - wp_sq
+
+    def eps(w):
+        return 1.0 - wp_sq / (w**2 - three_k2_v2)
+
+    h = 1e-5 * wp0
+    want = wp0 * (eps(wp0 + h) - eps(wp0 - h)) / (2.0 * h)
+    np.testing.assert_allclose(got, want, rtol=1e-7)
+
+
+def test_srs_couplings_conserve_the_factor_weighted_epw_energy():
+    """The separate solver's SRS couplings -- the EPW source (SpectralEPWSolver.calc_srs_source, which
+    carries n/n_env) and the two light couplings (CoupledLight.srs_depletion_coeff0 on E0,
+    RamanLight.srs_coeff on E1) -- conserve |E0|^2 + |E1|^2 + w |E_epw|^2 with w = epw_total_energy_factor / 2
+    (the light's total energy is twice its electric energy). For one resonant triplet, d/dt of each part
+    follows from the coefficients; w is solved from five random states at n/n_env = 0.75 and must be the
+    same for all and equal factor / 2: rtol 1e-10, fixed before the run (round-off)."""
+    from adept._lpse2d_cpp.core.epw import SpectralEPWSolver
+    from adept._lpse2d_cpp.core.light import CoupledLight
+    from adept._lpse2d_cpp.helpers import epw_total_energy_factor
+
+    cfg = _srs_box({"basis": "uniform", "val": 0.15}, 0.2)
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    epw = SpectralEPWSolver(cfg)
+    # the EPW source of uniform fields lands in the k = 0 mode: its coefficient, density factor included
+    a0, a1 = 0.7 - 0.2j, 0.3 + 0.5j
+    e0 = np.zeros((nx, ny, 3), dtype=np.complex128)
+    e1 = np.zeros((nx, ny, 3), dtype=np.complex128)
+    e0[..., 1], e1[..., 1] = a0, a1
+    src = np.asarray(epw.calc_srs_source(jnp.asarray(e0), jnp.asarray(e1)))
+    p_eff = src[0, 0] / (nx * ny) / (a0 * np.conj(a1))
+    light = CoupledLight(_srs_box({"basis": "uniform", "val": 0.15}, 0.2, pump_depletion=True))
+    a_dep, b_src = complex(light.srs_depletion_coeff0), complex(light.srs_coeff)
+    rng = np.random.default_rng(5)
+    k_sq = 3.7  # any |k|^2: it cancels
+    weights = []
+    for _ in range(5):
+        e0_, e1_, phi = rng.normal(size=3) + 1j * rng.normal(size=3)
+        lap = -k_sq * phi
+        d_light = 2.0 * np.real(np.conj(e0_) * a_dep * lap * e1_) + 2.0 * np.real(
+            np.conj(e1_) * b_src * np.conj(lap) * e0_
+        )
+        d_epw = 2.0 * k_sq * np.real(np.conj(phi) * p_eff * e0_ * np.conj(e1_))
+        weights.append(-d_light / d_epw)
+    factor = epw_total_energy_factor(cfg)
+    assert np.ptp(factor) == 0.0
+    np.testing.assert_allclose(weights, float(factor.flat[0]) / 2.0, rtol=1e-10)
