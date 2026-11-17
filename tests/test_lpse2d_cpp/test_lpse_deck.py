@@ -679,3 +679,79 @@ def test_translator_keeps_each_light_class_absorber(tmp_path):
     assert not any("abc.type" in u for u in report["unsupported"])
     _, report = _translate_minimal(tmp_path, base + "laser.solver = fd;\nraman.evolution.abc.type = pml;\n")
     assert any("abc.type differ" in u for u in report["unsupported"])
+
+
+_SEED_DECK = (
+    "lw.enable = true;\nlw.spectral.dt = 0.002;\nlw.SRS.enable = true;\nlaser.solver = fd;\nraman.enable = true;\n"
+    "raman.solver = fd;\nraman.evolution.Labc = 1;\nraman.nBeams = 1;\nraman.1.intensity = 1e12;\n"
+    "raman.1.direction = -1 0 0;\nraman.1.evolution.source = max.x;\n"
+)
+
+
+def test_translator_maps_the_raman_seed_profile_and_frequency_shift(tmp_path):
+    """Review 2026-11-16 B19: raman.1.evolution.{width, sgOrder, offset} and raman.1.frequencyShift were dropped.
+    LPSE's seed profile is exp(-(|y - offset_y| / width)^sgOrder) (SchrodingerSolver3::superGaussian, sgOrder
+    default 4) and its frequency shift a fraction of the Raman carrier W1 (LightSolver.cpp:2425), adept's
+    drivers.E1.yw (order 4, exp(-(y / (yw/2))^4)) and delta_omega. The injector's y profile, read from adept's
+    own seed source (spectral_light.smooth_seed_source), must equal LPSE's super-Gaussian (rtol 1e-12)."""
+    from adept._lpse2d_cpp.core.spectral_light import smooth_seed_source
+
+    cfg, report = _translate_minimal(
+        tmp_path,
+        _SEED_DECK + "raman.1.evolution.width = 3;\nraman.1.evolution.sgOrder = 4;\nraman.1.frequencyShift = 0.02;\n",
+    )
+    assert not any("raman" in u for u in report["unsupported"])
+    seed = cfg["drivers"]["E1"]
+    assert seed["yw"] == "6.0um" and seed["delta_omega"] == 0.02
+    cfg = _finish(cfg)
+    args = cfg["drivers"]["E1"]["derived"]
+    y = np.asarray(cfg["grid"]["y"])
+    x = np.asarray(cfg["grid"]["x"])
+    source = smooth_seed_source(
+        0.05, args, w=1.0, c=1.0, x=x, y=y, x_inject=x[-20], wpe_sq=0.25, profile=np.ones_like(x)
+    )
+    profile = np.abs(np.asarray(source))[0] / np.abs(np.asarray(source))[0].max()
+    lpse = np.exp(-((np.abs(y) / 3.0) ** 4))
+    np.testing.assert_allclose(profile, lpse / lpse.max(), rtol=1e-12, atol=1e-300)
+    assert profile.min() < 1e-3  # the profile is resolved, not flat
+
+
+def test_translator_converts_the_raman_wavelength_shift_at_the_raman_wavelength(tmp_path):
+    """raman.1.wavelengthShift (Angstrom) means the seed's vacuum wavelength minus the Raman light's,
+    lambda_1 = lambda_0 w0 / W1 (W1 = w0 - wp0; wp0 with the combined solver): delta_omega = -dlambda / lambda_1
+    to first order, as LPSE's linear form. LPSE itself divides by lambda_0 (its light wavelength is still the
+    pump's when the beams are read), w0 / W1 = 2x larger at 0.25 n_c; adept keeps the physical shift and
+    notes it. Tolerance rel 1e-12."""
+    cfg, report = _translate_minimal(tmp_path, _SEED_DECK + "raman.1.wavelengthShift = 10;\n")
+    lambda_1 = 0.351 / (1.0 - np.sqrt(0.25))
+    assert cfg["drivers"]["E1"]["delta_omega"] == pytest.approx(-1.0e-3 / lambda_1, rel=1e-12)
+    assert any("wavelengthShift" in n for n in report["notes"])
+
+
+@pytest.mark.parametrize(
+    "line, fragment",
+    [
+        ("raman.nBeams = 2;\nraman.2.intensity = 1e12;\n", "raman.nBeams = 2"),
+        ("raman.1.phase = 30;\n", "raman.1.phase"),
+        ("raman.1.bandwidth.KAP.frequency = 0.001;\n", "KAP"),
+        ("raman.1.direction = -1 0.2 0;\n", "raman.1.direction"),
+        ("raman.1.evolution.width = 3;\nraman.1.evolution.sgOrder = 6;\n", "sgOrder = 6"),
+        ("raman.1.evolution.width = 3;\nraman.1.evolution.offset = 0 2 0;\n", "offset"),
+    ],
+)
+def test_translator_reports_raman_seed_keys_it_cannot_represent(tmp_path, line, fragment):
+    """B19: what adept's single, leftward, order-4 seed cannot carry is reported, not dropped."""
+    _, report = _translate_minimal(tmp_path, _SEED_DECK + line)
+    assert any(fragment in u for u in report["unsupported"]), report["unsupported"]
+
+
+def test_translator_seed_face_and_beam_format_follow_lpse(tmp_path):
+    """LPSE's beam face defaults to min.x (sourceTag 1, LightSolver.cpp:1705), so a seed without
+    raman.1.evolution.source is not adept's x-max seed; the abbreviated beam format (LightSolver.cpp:1460-1478),
+    which the translator does not read, raises instead of translating zero intensity."""
+    deck = _SEED_DECK.replace("raman.1.evolution.source = max.x;\n", "")
+    _, report = _translate_minimal(tmp_path, deck)
+    assert any("evolution.source" in u for u in report["unsupported"])
+    deck = _SEED_DECK.replace("raman.1.intensity = 1e12;\n", "raman.intensity = [1e12];\n")
+    with pytest.raises(ValueError, match="abbreviated"):
+        _translate_minimal(tmp_path, deck)

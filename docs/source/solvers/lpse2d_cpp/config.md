@@ -366,10 +366,10 @@ propagates toward the low-density side while backscatter growth amplifies it aga
 | Field | Type | Description |
 |-------|------|-------------|
 | `intensity` | string | Seed vacuum intensity with unit, e.g. `"1.0e+12W/cm^2"` |
-| `delta_omega` | float | Seed frequency shift relative to `w1 = w0 - wp0`, as a fraction of `w1` (default 0) |
+| `delta_omega` | float | Seed frequency shift relative to `w1 = w0 - wp0` (`wp0` with the combined solver), as a fraction of it (default 0). The deck translator maps LPSE's `raman.1.frequencyShift` (the same fraction of the Raman carrier, `LightSolver.cpp:2425`); a `raman.1.wavelengthShift` (Angstrom) becomes `-dlambda / lambda_1` with the Raman light's own vacuum wavelength `lambda_1 = lambda_0 w0 / w1`, where LPSE divides by `lambda_0` (see Departures from LPSE in the overview) |
 | `turn_on_time` | string | Ramp-up time of the injector, `1 - exp(-(t / turn_on_time)^2)` (default `30fs`, LPSE's; the deck translator uses LPSE's `raman.evolution.riseTime`, default 30 fs) |
 | `offset` | string | Distance of the injector from the right boundary (its first injected row). Defaults to `1.6 * boundary_width`, just inside the absorbing boundary's tanh skirt; with the tanh profile a warning is printed for smaller values because the seed would be damped at the source. The deck translator puts it on LPSE's plane, `int(Labc / h) + int(Loff / h)` nodes in from x-max (raman.evolution) |
-| `yw` | string | Super-Gaussian (4th order) width of the seed in y; omit for uniform in y |
+| `yw` | string | Super-Gaussian (4th order) full width of the seed in y, `exp(-(y / (yw/2))^4)` about `y = 0`; omit for uniform in y. The deck translator maps LPSE's `raman.1.evolution.width` (`exp(-(\|y\| / width)^sgOrder)`) as `yw = 2 width` when `sgOrder` is 4 and the offset is zero, and reports any other order or offset; before 2026-11-17 it dropped the profile (a uniform seed, e.g. test_007). `raman.nBeams > 1`, `raman.1.phase`, `raman.1.bandwidth.KAP.frequency` and a seed not along -x from x-max (LPSE's default face is `min.x`) are reported |
 | `injector_width` | string | (`terms.light.solver: spectral`, optional) Gaussian width of the smooth seed injector, with unit. Default half a local wavelength `pi / k1(n_inject)` |
 | `polarization` | number or string | (default `p`) seed polarization angle in degrees about the beam axis (LPSE `raman.N.polarization`): `0` / `p` in-plane (y), `90` / `s` along z; the injector writes `cos(psi)` to y and `sin(psi)` to z |
 

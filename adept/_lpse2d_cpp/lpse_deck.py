@@ -781,6 +781,11 @@ def translate_parms(
     # ---- laser beams (static: intensities summed; direction along +x expected). A disabled laser
     # keeps a beam-free E0 driver at zero intensity, the form the shipped laser-off decks take.
     n_beams = int(float(g("laser.nBeams", "1"))) if laser_on else 0
+    for cls, count in (("laser", n_beams), ("raman", int(float(g("raman.nBeams", "0"))) if raman_on else 0)):
+        # LPSE reads the abbreviated beam format ({cls}.intensity = [...], one vector per key) when
+        # {cls}.1.intensity is absent (LightSolver.cpp:1460-1478); the translator reads only the per-beam keys
+        if count > 0 and f"{cls}.intensity" in parms and f"{cls}.1.intensity" not in parms:
+            raise ValueError(f"{cls}.intensity: LPSE's abbreviated beam format is not translated; list {cls}.N.* keys")
     if not laser_on:
         listed = sum(float(v) for k, v in parms.items() if re.fullmatch(r"laser\.\d+\.intensity", k))
         report["notes"].append(
@@ -1001,18 +1006,59 @@ def translate_parms(
             "raman.sourceTerm.lw.enable = false: adept's Raman light is always driven by the EPW"
         )
     n_seed = 0
-    if raman_on and int(float(g("raman.nBeams", "0"))) > 0:
+    n_raman_beams = int(float(g("raman.nBeams", "0")))
+    if raman_on and n_raman_beams > 0:
         # the seed from x-max at LPSE's plane, with raman.evolution.riseTime (default 30 fs,
-        # LightSolver.cpp:1288) as its turn-on
-        if str(g("raman.1.evolution.source", "max.x")).lower() != "max.x":
+        # LightSolver.cpp:1288) as its turn-on. LPSE's beam keys (LightSolver::readBeamletParameters,
+        # LightSolver.cpp:1675-1800): adept's seed is one leftward beam with an optional order-4 profile
+        if n_raman_beams > 1:
+            report["unsupported"].append(f"raman.nBeams = {n_raman_beams}: adept injects one Raman seed (beam 1)")
+        # LPSE's default face is min.x (sourceTag 1, LightSolver.cpp:1705) and default direction +x (:1699)
+        if str(g("raman.1.evolution.source", "min.x")).lower() != "max.x":
             report["unsupported"].append("raman.1.evolution.source != max.x: adept's seed enters from x-max")
+        seed_dir = _floats(g("raman.1.direction", "1 0 0"))
+        if not (seed_dir[0] < 0.0 and all(abs(v) <= 1e-6 * abs(seed_dir[0]) for v in seed_dir[1:])):
+            report["unsupported"].append(f"raman.1.direction = {seed_dir}: adept's seed travels along -x")
+        if float(g("raman.1.bandwidth.KAP.frequency", "0")) > 0.0:
+            report["unsupported"].append("raman.1.bandwidth.KAP.frequency: adept's seed has no bandwidth")
+        if float(g("raman.1.phase", "0")) != 0.0:
+            # a single seed's phase only rotates E1 and the EPW it drives (the noise is random-phase)
+            report["unsupported"].append("raman.1.phase: adept's seed has no phase parameter")
+        # the frequency shift, a fraction of the Raman class's carrier W1 (w0 - wp0; wp0 combined): LPSE's
+        # beam omega = frequencyShift * W1 (LightSolver.cpp:2425), as adept's delta_omega. A wavelength
+        # shift (Angstrom) is taken relative to the Raman light's own vacuum wavelength lambda_1 = lambda_0
+        # w0 / W1, the key's meaning; LPSE divides by lambda_0 instead (lightWavelength_um is still the pump's
+        # when the beams are read, LightSolver.cpp:942 / 1730 / 2420), a shift w0 / W1 times larger
+        seed_shift = float(g("raman.1.frequencyShift", "0"))
+        seed_wavelength_shift = float(g("raman.1.wavelengthShift", "0"))
+        if seed_wavelength_shift != 0.0:
+            w1_over_w0 = np.sqrt(n_env) if epw_solver == "combined" else 1.0 - np.sqrt(n_env)
+            seed_shift = -(1.0e-4 * seed_wavelength_shift) * w1_over_w0 / wavelength_um
+            report["notes"].append(
+                f"raman.1.wavelengthShift relative to the Raman wavelength {wavelength_um / w1_over_w0:.4g} um: "
+                f"delta_omega = {seed_shift:.4g} (LPSE divides by the laser wavelength, {1.0 / w1_over_w0:.3g}x this)"
+            )
         n_seed = injector_cells("raman.evolution.", "max")
         drivers["E1"] = {
             "intensity": f"{float(g('raman.1.intensity', '0'))}W/cm^2",
             "polarization": float(g("raman.1.polarization", "0")),
             "offset": f"{(n_seed + 0.5) * dx}um",
             "turn_on_time": f"{float(g('raman.evolution.riseTime', '30'))}fs",
+            **({"delta_omega": float(seed_shift)} if seed_shift != 0.0 else {}),
         }
+        # the transverse profile exp(-(|r - offset| / width)^sgOrder) (SchrodingerSolver3::superGaussian; width 0
+        # or order 0 is flat): adept's yw is the order-4 profile exp(-(y / (yw / 2))^4) about y = 0
+        seed_width = float(g("raman.1.evolution.width", "0"))
+        seed_order = float(g("raman.1.evolution.sgPower", g("raman.1.evolution.sgOrder", "4")))
+        seed_offset = (list(_floats(g("raman.1.evolution.offset", "0 0 0"))) + [0.0, 0.0, 0.0])[:3]
+        if seed_width > 0.0 and seed_order != 0.0:
+            if seed_order != 4.0 or any(v != 0.0 for v in seed_offset[1:]):
+                report["unsupported"].append(
+                    f"raman.1.evolution.sgOrder = {seed_order:g} / offset = {seed_offset}: adept's seed profile is "
+                    "order 4 about y = 0"
+                )
+            elif ny > 1:
+                drivers["E1"]["yw"] = f"{2.0 * seed_width}um"
 
     # ---- IAW
     iaw = None

@@ -168,7 +168,9 @@ def _translate(tmp_path, extra):
     deck.write_text(
         "grid.sizes = 20 10;\ngrid.nodes = 201 101;\nsimulation.time.end = 1;\nlw.enable = true;\n"
         "laser.enable = true;\nlaser.solver = spectral;\nlaser.nBeams = 1;\nlaser.1.intensity = 1e15;\n"
-        "raman.enable = true;\nraman.solver = spectral;\nraman.nBeams = 1;\nraman.1.intensity = 1e12;\n" + extra
+        "raman.enable = true;\nraman.solver = spectral;\nraman.nBeams = 1;\nraman.1.intensity = 1e12;\n"
+        # LPSE's beam defaults are direction +x from min.x (LightSolver.cpp:1699, 1705): name the x-max seed
+        "raman.1.direction = -1 0 0;\nraman.1.evolution.source = max.x;\n" + extra
     )
     return translate_parms(parse_parms(deck), run="x")
 
