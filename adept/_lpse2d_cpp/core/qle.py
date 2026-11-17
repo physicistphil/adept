@@ -242,7 +242,12 @@ class QuasilinearEvolution:
         over the slope functional, ``gamma_k = kappa_k S_k[f]``. The wave then loses what the electrons
         gain (to the grid's O(dv^2) error) whatever the form, threshold and multiplier -- calibration x
         multiplier, 0 where the threshold zeroes the rate. Without ``landau_evolution``, the static
-        rate's factor on the Maxwellian."""
+        rate's factor on the Maxwellian.
+
+        Known limitation: with a relativistic form ``kappa_k`` is well below 1 for fast modes (Te = 2 keV:
+        0.58 at k lambda_D 0.25, 0.024 at 0.15), so the non-relativistic VDF's response to them -- the
+        tail flattening -- is slowed by ``1 / kappa_k``. Energy balances; the flattening rate does not
+        match the relativistic plasma's until the VDF is a momentum-space Maxwell-Juttner one."""
         if not self.landau_evolution:
             return self.static_coupling
         coupling = self.landau_multiplier * self.landau_calibration
