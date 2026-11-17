@@ -3,6 +3,7 @@
 from copy import deepcopy
 
 import numpy as np
+import pytest
 import yaml
 from jax import numpy as jnp
 
@@ -232,6 +233,43 @@ def test_translator_maps_the_thomson_probes():
         {"k": [-0.5, 0.5], "bandwidth": 0.0, "field": "epw"},
     ]
     assert any("thomsonScattering.1.wavevector.iaw" in note for note in report["notes"])
+
+
+@pytest.mark.parametrize("deck", ["test_010", "test_013", "test_022", "test_032"])
+def test_thomson_window_holds_lpses_sample_count(deck):
+    """Ground truth (physics review 2026-11-16, B8): for every Thomson probe of the shipped LPSE runs the
+    translated probe's window holds exactly the number of grid points LPSE reports in its
+    ``data/thomson_N.dat`` header ("Number of samples: (rho=...)"). Exact. Skipped without the
+    original-lpse runs. The values are not asserted: LPSE's potential frames and its Thomson samples are
+    one LPSE step apart (0.06-0.2 fs). Applied to the frames of test_013, test_022 and test_032, the
+    probe was within 0.1-5.4 % (complex relative difference) of the next sample in 21 of 22 cases and
+    18 % in the last (test_032, probe 1, 8 ps), consistent with one step of envelope-frame rotation."""
+    from adept._lpse2d_cpp.helpers import get_derived_quantities, get_solver_quantities, write_units
+    from adept._lpse2d_cpp.lpse_deck import parse_parms, translate_parms
+    from adept._lpse2d_cpp.parity import lpse_root
+
+    root = lpse_root()
+    run = None if root is None else root / "runs" / deck
+    if run is None or not (run / "data" / "thomson_1.dat").is_file():
+        pytest.skip(f"original-lpse run {deck} with Thomson output not available")
+    cfg, _ = translate_parms(parse_parms(run / "lpse.parms"), run=deck)
+    write_units(cfg)
+    cfg = get_derived_quantities(cfg)
+    cfg["grid"] = get_solver_quantities(cfg)
+    d = cfg["units"]["derived"]
+    kx = np.asarray(cfg["grid"]["kx"])[:, None]
+    ky = np.asarray(cfg["grid"]["ky"])[None, :]
+    k0 = d["w0"] / d["c"]
+    probes = cfg["save"]["thomson"]
+    assert probes
+    for i, probe in enumerate(probes, start=1):
+        text = (run / "data" / f"thomson_{i}.dat").read_text()
+        n_lpse = int(text.split("rho=")[1].split(")")[0])
+        dist_sq = (kx - probe["k"][0] * k0) ** 2 + (ky - probe["k"][1] * k0) ** 2
+        radius_sq = (probe["bandwidth"] * k0) ** 2
+        if not np.any(dist_sq <= radius_sq * (1.0 + 1e-9)):
+            radius_sq = 1.01 * float(dist_sq.min())
+        assert int(np.sum(dist_sq <= radius_sq * (1.0 + 1e-9))) == n_lpse, (deck, i)
 
 
 def _combined_cfg(envelope_density=0.25, density=0.2):
