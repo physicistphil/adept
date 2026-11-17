@@ -131,6 +131,64 @@ def test_diffusion_tensor_conserves_wave_plus_electron_energy():
         assert abs(heating / loss - 1.0) < tol, (k_lambda_d, heating / loss)
 
 
+@pytest.mark.parametrize("form", ["relativistic", "lpse"])
+@pytest.mark.parametrize("evolution", [True, False])
+@pytest.mark.parametrize("thresholded", [False, True])
+def test_exchange_balances_with_the_applied_rate(form, evolution, thresholded):
+    """Each mode's diffusion carries the coupling of the Landau rate applied to it (form, multiplier,
+    threshold; the evolved or the static rate), so a spectral line's electron heating equals its wave
+    loss sum 2 gamma_applied W_k on the Maxwellian, with the tolerances of
+    test_diffusion_tensor_conserves_wave_plus_electron_energy (3 % at k lambda_D 0.15, 8 % at 0.25).
+    With a threshold between two modes of the 0.25 line, that line still balances, the 0.15 line (all
+    below it) and a thresholded mode alone heat nothing (exact). The QLE refuses landau: false."""
+    from adept._lpse2d_cpp.core.epw import analytic_landau_rate
+    from adept._lpse2d_cpp.core.qle import QuasilinearEvolution, initial_vdf
+
+    cfg = _cfg(xmax="25.6um", nv=481, v_max=0.6, landau_evolution=evolution)
+    damping = cfg["terms"]["epw"]["damping"]
+    damping["landau_form"] = form
+    damping["landau_multiplier"] = 1.3
+    d = cfg["units"]["derived"]
+    wpe, vte_sq, e, me = d["wp0"], d["vte_sq"], d["e"], d["me"]
+    kx = np.asarray(cfg["grid"]["kx"])
+    lam = np.sqrt(vte_sq) / wpe
+    rate_form = np.asarray(analytic_landau_rate(cfg))[:, 0] / 1.3  # the form, before the multiplier
+    i25 = int(np.argmin(np.abs(kx * lam - 0.25)))
+    # a threshold between two modes of the 0.25 line: its lower modes are zeroed, the rest kept
+    if thresholded:
+        damping["landau_lower_threshold"] = float(0.5 * (rate_form[i25 - 1] + rate_form[i25]))
+    qle = QuasilinearEvolution(cfg)
+    f0 = jnp.asarray(initial_vdf(cfg))
+    fp = np.gradient(np.asarray(f0), qle.dv)
+    v = np.asarray(qle.v)
+    n_m = wpe**2 * me**2 / (4.0 * np.pi * e**2)
+    applied = np.asarray(qle.landau_rate(f0) if evolution else analytic_landau_rate(cfg))[:, 0]
+    coupling = qle.coupling(f0)
+    assert applied[i25] > 0.0 and (applied[i25 - 1] == 0.0) == thresholded
+    for k_lambda_d, tol in ((0.15, 0.03), (0.25, 0.08)):
+        phi_k, _, line, amps = _line(cfg, k_lambda_d, 1e-11)
+        c = np.asarray(qle.diffusion_tensor(phi_k, coupling))[:, 0]
+        heating = -n_m * np.sum(v * c * fp) * qle.dv
+        if thresholded and k_lambda_d == 0.15:
+            assert np.all(applied[line] == 0.0) and np.all(c == 0.0)
+            continue
+        loss = 0.0
+        for j, a in zip(line, amps, strict=True):
+            k = kx[j]
+            omega = np.sqrt(wpe**2 + 3.0 * vte_sq * k**2)
+            energy_factor = 1.0 + (wpe**2 + 9.0 * k**2 * vte_sq) / omega**2
+            loss += 2.0 * applied[j] * (k * a) ** 2 / (16.0 * np.pi) * energy_factor
+        assert abs(heating / loss - 1.0) < tol, (form, evolution, k_lambda_d, heating / loss)
+    # a thresholded mode alone heats nothing
+    single = np.zeros((cfg["grid"]["nx"], cfg["grid"]["ny"]), dtype=complex)
+    single[i25 - 1, 0] = 1e-11 * cfg["grid"]["nx"] * cfg["grid"]["ny"]
+    single_c = np.asarray(qle.diffusion_tensor(jnp.asarray(single), coupling))
+    assert np.all(single_c == 0.0) if thresholded else np.any(single_c > 0.0)
+    damping["landau"] = False
+    with pytest.raises(ValueError, match=r"terms\.qle needs terms\.epw\.damping\.landau"):
+        QuasilinearEvolution(cfg)
+
+
 @pytest.mark.parametrize(
     "ny_box, xmax, nv, k_lambda_d, angles",
     [

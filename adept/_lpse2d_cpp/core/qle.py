@@ -202,6 +202,11 @@ class QuasilinearEvolution:
         from adept._lpse2d_cpp.core.epw import analytic_landau_rate
 
         damping = cfg["terms"]["epw"]["damping"]
+        if not damping.get("landau", True):
+            raise ValueError(
+                "terms.qle needs terms.epw.damping.landau: the quasilinear diffusion is the electron side of "
+                "the Landau damping, and without it the electrons would gain energy no wave loses"
+            )
         form_cfg = {
             **cfg,
             "terms": {
@@ -225,6 +230,25 @@ class QuasilinearEvolution:
         self.landau_calibration = jnp.asarray(np.where(calibrated, gamma_form / np.where(calibrated, s_ref, 1.0), 1.0))
         # off the velocity grid the fluid rate stays (the VDF does not represent that resonance)
         self.off_grid_rate = jnp.asarray(np.where(valid, 0.0, gamma_form))
+        # without landau_evolution the applied rate is the static fluid rate: each mode's diffusion
+        # carries rate / S_k[f_M], so the exchange balances on the Maxwellian
+        static = np.asarray(analytic_landau_rate(cfg), dtype=np.float64)
+        self.static_coupling = jnp.asarray(
+            np.where(calibrated, static / np.where(calibrated, s_ref, 1.0), np.where(static > 0.0, 1.0, 0.0))
+        )
+
+    def coupling(self, f: Array) -> Array:
+        """Per-mode factor ``kappa_k`` on the diffusion of mode k, ``(nx, ny)``: the applied Landau rate
+        over the slope functional, ``gamma_k = kappa_k S_k[f]``. The wave then loses what the electrons
+        gain (to the grid's O(dv^2) error) whatever the form, threshold and multiplier -- calibration x
+        multiplier, 0 where the threshold zeroes the rate. Without ``landau_evolution``, the static
+        rate's factor on the Maxwellian."""
+        if not self.landau_evolution:
+            return self.static_coupling
+        coupling = self.landau_multiplier * self.landau_calibration
+        if self.landau_threshold > 0.0:
+            coupling = jnp.where(self.landau_calibration * self._slope_rate(f) > self.landau_threshold, coupling, 0.0)
+        return coupling
 
     # ----------------------------------------------------------------- tensor --
 
@@ -232,11 +256,14 @@ class QuasilinearEvolution:
         """``|phi_k / N|^2`` on the (nx, ny) k grid: the squared Fourier coefficient."""
         return jnp.abs(phi_k) ** 2 / self.n_cells**2
 
-    def diffusion_tensor(self, phi_k: Array) -> Array:
+    def diffusion_tensor(self, phi_k: Array, coupling: Array | None = None) -> Array:
         """``C_ij(v)`` on the velocity grid, the cell average of every mode's resonance:
-        ``(nv, nv, 3)`` [C_xx, C_yy, C_xy] in 2-D, ``(nv, 1)`` [C_xx] in 1-D."""
-        phi_sq = self._phi_sq_coef(phi_k)[self.mode_index]
-        weights = self.deposit_constant * phi_sq[:, None] * self.mode_geometry  # (n_modes, n_comp)
+        ``(nv, nv, 3)`` [C_xx, C_yy, C_xy] in 2-D, ``(nv, 1)`` [C_xx] in 1-D. ``coupling`` (nx, ny) scales
+        each mode's share (``self.coupling(f)`` in the update); None is the bare quasilinear tensor."""
+        phi_sq = self._phi_sq_coef(phi_k)
+        if coupling is not None:
+            phi_sq = phi_sq * coupling
+        weights = self.deposit_constant * phi_sq[self.mode_index][:, None] * self.mode_geometry  # (n_modes, n_comp)
         if not self.is_2d:
             c = jnp.zeros(self.nv).at[self.deposit_index.ravel()].add((self.deposit_weight * weights[:, :1]).ravel())
             return (c / self.dv)[:, None]
@@ -301,8 +328,9 @@ class QuasilinearEvolution:
         return (fx[1:, :] - fx[:-1, :]) / dv + (fy[:, 1:] - fy[:, :-1]) / dv
 
     def evolve_vdf(self, f: Array, phi_k: Array, dt: float) -> Array:
-        """One quasilinear update of ``f`` over ``dt`` in the spectrum ``phi_k``."""
-        tensor = self.diffusion_tensor(phi_k)
+        """One quasilinear update of ``f`` over ``dt`` in the spectrum ``phi_k``, each mode diffusing the
+        electrons with the coupling of the Landau rate applied to it (``coupling``)."""
+        tensor = self.diffusion_tensor(phi_k, self.coupling(f))
         c_max = jnp.max(jnp.abs(tensor))
         dt_max = self.dv**2 / (2.0 * self.ndim * jnp.where(c_max > 0.0, c_max, 1.0))
         n_needed = jnp.where(c_max > 0.0, jnp.ceil(dt / dt_max), 1.0) * self.subcycling
