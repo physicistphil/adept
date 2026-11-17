@@ -145,15 +145,15 @@ class QuasilinearEvolution:
         kx = np.asarray(grid["kx"], dtype=np.float64)
         ky = np.asarray(grid["ky"], dtype=np.float64)
         self.kx, self.ky = jnp.asarray(kx), jnp.asarray(ky)
-        band = float(grid.get("low_pass_filter", 1.0))
-        self.k_max = np.pi / self.dx * band
         self.n_cells = self.nx * self.ny
         k_sq = kx[:, None] ** 2 + ky[None, :] ** 2
         k_mag = np.sqrt(k_sq)
         omega = np.sqrt(self.wpe**2 + 3.0 * self.vte_sq * k_sq) if self.thermal_correction else self.wpe
         with np.errstate(divide="ignore", invalid="ignore"):
             v_phase = np.where(k_mag > 0, omega / np.where(k_mag > 0, k_mag, 1.0), np.inf)
-        inside = (np.abs(kx)[:, None] <= self.k_max) & (np.abs(ky)[None, :] <= self.k_max)
+        # the EPW solver's own retained band (LPSE's rounded anti-aliasing mask, lw.maxWavenumber
+        # included): every mode the solver keeps both damps and diffuses the VDF
+        inside = np.asarray(grid["low_pass_filter_grid"]) > 0.0
 
         # ---- the resonance deposit of C_ij: every retained mode, weight k_i k_j / |k|
         mode_ix, mode_iy = np.nonzero(inside & (k_mag > 0))

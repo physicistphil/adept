@@ -179,6 +179,22 @@ def test_exchange_balances_with_the_applied_rate(form, evolution, thresholded):
             energy_factor = 1.0 + (wpe**2 + 9.0 * k**2 * vte_sq) / omega**2
             loss += 2.0 * applied[j] * (k * a) ** 2 / (16.0 * np.pi) * energy_factor
         assert abs(heating / loss - 1.0) < tol, (form, evolution, k_lambda_d, heating / loss)
+    # every mode the solver retains takes part, the rounded band-edge modes beyond the continuous
+    # cutoff pi / dx * low_pass_filter included (PR #378 review): on the grid, coupled, and its
+    # heating balances its loss (8 %, the k lambda_D 0.25 tolerance; these sit at 0.295)
+    band = np.asarray(cfg["grid"]["low_pass_filter_grid"])[:, 0] > 0
+    edge = np.nonzero(band & (np.abs(kx) > np.pi / cfg["grid"]["dx"] * cfg["grid"]["low_pass_filter"]))[0]
+    assert edge.size > 0 and np.all(np.asarray(qle.k_valid)[edge, 0])
+    for j in edge:
+        one = np.zeros((cfg["grid"]["nx"], cfg["grid"]["ny"]), dtype=complex)
+        one[j, 0] = 1e-11 * cfg["grid"]["nx"] * cfg["grid"]["ny"]
+        c = np.asarray(qle.diffusion_tensor(jnp.asarray(one), coupling))[:, 0]
+        heating = -n_m * np.sum(v * c * fp) * qle.dv
+        k = kx[j]
+        omega = np.sqrt(wpe**2 + 3.0 * vte_sq * k**2)
+        energy_factor = 1.0 + (wpe**2 + 9.0 * k**2 * vte_sq) / omega**2
+        loss = 2.0 * applied[j] * (k * 1e-11) ** 2 / (16.0 * np.pi) * energy_factor
+        assert loss > 0.0 and abs(heating / loss - 1.0) < 0.08, (j, heating / loss)
     # a thresholded mode alone heats nothing
     single = np.zeros((cfg["grid"]["nx"], cfg["grid"]["ny"]), dtype=complex)
     single[i25 - 1, 0] = 1e-11 * cfg["grid"]["nx"] * cfg["grid"]["ny"]
