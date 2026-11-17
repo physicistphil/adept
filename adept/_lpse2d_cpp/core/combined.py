@@ -50,8 +50,11 @@ spectral propagator and LPSE's unified depletion term (``LightSolver.cpp:4265``)
 which contains both the SRS depletion (``E1_T div E1``, ``i e/(4 me w1)`` at n_c/4)
 and the TPD depletion (``E1_L div E1``), unprojected: LPSE takes the transverse part of
 source terms only outside combined mode (``LightSolver.cpp:4325``), so
-``terms.light.tpd_projection`` does not apply here. Otherwise the pump is the prescribed field
-of ``laser.py``.
+``terms.light.tpd_projection`` does not apply here. The pump's k-space step propagates its
+transverse part and keeps its longitudinal part on the light band (the anti-aliased band and
+``terms.light.max_wavenumber``, not ``terms.epw.max_wavenumber``) and zeroes every k > 0
+component outside it (LPSE's laser class, ``LightSolver.cpp:3689-3741``). Otherwise the pump is
+the prescribed field of ``laser.py``.
 """
 
 import numpy as np
@@ -64,7 +67,13 @@ from adept._lpse2d_cpp.core.kap import KapPhases
 from adept._lpse2d_cpp.core.light import CoupledLight
 from adept._lpse2d_cpp.core.pulse import PulseShape
 from adept._lpse2d_cpp.core.raman import RamanLight, light_absorption_rates, light_source_mask
-from adept._lpse2d_cpp.core.spectral_light import SmoothPumpInjector, gaussian_injector_profile, smooth_seed_source
+from adept._lpse2d_cpp.core.spectral_light import (
+    SmoothPumpInjector,
+    SpectralRamanLight,
+    gaussian_injector_profile,
+    smooth_seed_source,
+    transverse_propagate,
+)
 from adept._lpse2d_cpp.core.timeline import as_linear
 from adept._lpse2d_cpp.core.vector import dot_conj, fft2c, ifft2c, k_dot, split_k
 
@@ -243,7 +252,14 @@ class CombinedSolver(SmoothPumpInjector):
             self.E0_source = derived["E0_source"]
             self.linear_coeff0 = 1j * self.w0 / 2.0 * (1.0 - self.wp0**2 / self.w0**2 * self.n_over_env)
             self.detune0 = jnp.exp(self.dt_l * self.linear_coeff0)
-            self.prop0 = jnp.exp(-1j * self.dt_l * self.c**2 / (2.0 * self.w0) * self.k_sq) * self.propagation_band
+            # the pump is LPSE's laser class: its spectral step keeps the anti-aliased band and the light's
+            # own cap (terms.light.max_wavenumber), never lw.maxWavenumber (the combined field's cap only,
+            # LightSolver.cpp:3689), and zeroes every k > 0 component outside it, the longitudinal part
+            # (which the unprojected depletion term feeds) included (LightSolver.cpp:3696-3741); k = 0 is
+            # left untouched. As SpectralCoupledLight's pump
+            k_pos = np.where(k_sq_np > 0, 1.0, 0.0)
+            self.pump_band = jnp.asarray(SpectralRamanLight._light_band(cfg, k_sq_np) * k_pos + (1.0 - k_pos))
+            self.prop0 = jnp.exp(-1j * self.dt_l * self.c**2 / (2.0 * self.w0) * self.k_sq) * self.pump_band
             self.depletion_coeff = 1j * self.e / (2.0 * self.me * self.w0)
             rate0, _ = light_absorption_rates(cfg)
             self.absorption_rate0 = rate0
@@ -337,8 +353,9 @@ class CombinedSolver(SmoothPumpInjector):
         )
 
     def propagate_pump(self, E0: Array) -> Array:
-        longitudinal_k, transverse_k = longitudinal_transverse(E0, self.kx, self.ky, self.one_over_k_sq)
-        return ifft2c(longitudinal_k + self.prop0[..., None] * transverse_k)
+        """The pump's k-space step: the transverse part propagated, the longitudinal part kept, both
+        zeroed outside the pump's band (LPSE laser class, ``LightSolver::evolveSpectral``)."""
+        return transverse_propagate(E0, self.kx, self.ky, self.one_over_k_sq, self.prop0, self.pump_band)
 
     # ---------------------------------------------------------------- step --
 

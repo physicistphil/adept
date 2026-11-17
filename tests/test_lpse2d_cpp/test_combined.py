@@ -402,6 +402,47 @@ def test_combined_pump_depletion_is_not_projected():
     np.testing.assert_allclose(np.asarray(solver.unified_depletion(0.3, E1)), np.asarray(expected), rtol=1e-12)
 
 
+def test_combined_pump_keeps_the_light_band_for_both_parts():
+    """The evolved pump is LPSE's laser class (LightSolver::evolveSpectral, LightSolver.cpp:3689-3741):
+    on its band -- the anti-aliased band, not lw.maxWavenumber, which caps only the combined field --
+    the transverse part is propagated and the longitudinal part kept; every k > 0 component outside
+    it is zeroed, the longitudinal part included; k = 0 passes unchanged (physics review 2026-11-16,
+    B23). Reference: the L/T split and the propagator written out in numpy on a random 3-component
+    field; rtol / atol 1e-12 of the field's scale. The old step kept the longitudinal part
+    everywhere and cut the transverse part at the EPW cap."""
+    from adept._lpse2d_cpp.core.combined import CombinedSolver
+
+    raw = _combined_raw(pump_depletion=True)
+    raw["terms"]["epw"]["boundary"] = {"x": "absorbing", "y": "periodic"}
+    raw["terms"]["epw"]["max_wavenumber"] = 0.8
+    cfg = _finish(raw)
+    solver = CombinedSolver(cfg)
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    rng = np.random.default_rng(17)
+    E0 = rng.normal(size=(nx, ny, 3)) + 1j * rng.normal(size=(nx, ny, 3))
+    got = np.fft.fft2(np.asarray(solver.propagate_pump(jnp.asarray(E0))), axes=(0, 1))
+
+    d = cfg["units"]["derived"]
+    kx = np.asarray(cfg["grid"]["kx"])[:, None]
+    ky = np.asarray(cfg["grid"]["ky"])[None, :]
+    k_sq = np.broadcast_to(kx**2 + ky**2, (nx, ny))
+    e_k = np.fft.fft2(E0, axes=(0, 1))
+    k_dot_e = kx * e_k[..., 0] + ky * e_k[..., 1]
+    inv = np.where(k_sq > 0, 1.0 / np.where(k_sq > 0, k_sq, 1.0), 0.0)
+    long_k = np.stack([kx * k_dot_e * inv, ky * k_dot_e * inv, np.zeros_like(k_dot_e)], axis=-1)
+    prop = np.exp(-1j * solver.dt_l * d["c"] ** 2 / (2.0 * d["w0"]) * k_sq)[..., None]
+    want = long_k + prop * (e_k - long_k)
+    anti_aliased = np.asarray(cfg["grid"]["light_low_pass_filter_grid"]) > 0
+    in_band = anti_aliased & (k_sq > 0)
+    above_epw_cap = in_band & (np.sqrt(k_sq) >= 0.8 * d["w0"] / d["c"])
+    outside = ~anti_aliased
+    assert above_epw_cap.sum() > 10 and outside.sum() > 10
+    scale = np.abs(e_k).max()
+    np.testing.assert_allclose(got[in_band], want[in_band], rtol=1e-12, atol=1e-12 * scale)
+    assert np.abs(got[outside]).max() < 1e-12 * scale
+    np.testing.assert_allclose(got[0, 0], e_k[0, 0], rtol=1e-12)
+
+
 def test_combined_solver_applies_the_quasilinear_landau_rate():
     """With qle.landau_evolution the state's gamma_L is the EPW damping in combined mode too."""
     from adept._lpse2d_cpp.core.combined import CombinedSolver

@@ -68,7 +68,13 @@ class FDCombinedSolver(CoupledLight):
         self.epw_source_mask = self.spectral.source_mask
         e0_filter = np.asarray(self.spectral.E0_filter)
         self.E0_filter = None if bool(np.all(e0_filter == 1.0)) else jnp.asarray(e0_filter)
-        # Landau damping / noise once per EPW step (the LW step)
+        # Landau damping / noise once per EPW step (the LW step). LPSE damps every k > 0 mode outside the
+        # anti-aliased region (LwSolver.cpp:815): neither lw.maxWavenumber nor the spectral light cap limits
+        # it on this path, which has no k-space band of its own; the noise keeps its own support (the kick
+        # spectrum: anti-aliased, below min(lw.noise.maxWavenumber, lw.maxWavenumber), LwSolver.cpp:859-873)
+        k_sq_np = np.asarray(self.spectral.k_sq)
+        anti_aliased = np.asarray(grid["light_low_pass_filter_grid"]) > 0.0
+        self.landau_band = jnp.asarray(np.where(anti_aliased & (k_sq_np > 0.0), 1.0, 0.0))
         self.noise_enabled = self.spectral.noise_enabled
         if self.noise_enabled:
             from adept._lpse2d_cpp.core.epw import noise_kick_spectrum
@@ -157,15 +163,15 @@ class FDCombinedSolver(CoupledLight):
     def langmuir_step(self, t: float, E1: Array, gamma_landau) -> Array:
         """Landau damping and noise on the longitudinal part, once per EPW step (LwSolver::
         advanceLW_combinedTPDandSRS_FD): ``E_L -= E_L (1 - exp(-gamma dt))`` (``gamma dt`` below 1e-3)
-        and ``E += -i k phi_noise`` on the retained band."""
+        on every k > 0 mode of the anti-aliased band, and ``E += -i k phi_noise`` on the noise's own
+        support."""
         import jax
 
-        band = self.spectral.band
         e_k = fft2c(E1)
         rate_dt = gamma_landau * self.dt
         # LPSE's linearised coefficient only for |gamma dt| < 1e-3: a negative (inverse-Landau) rate of
         # any size takes the exponential, -expm1(-gamma dt) (LPSE tests the signed rate, PR #378 review)
-        coeff = jnp.where(jnp.abs(rate_dt) < 1.0e-3, rate_dt, -jnp.expm1(-rate_dt)) * band
+        coeff = jnp.where(jnp.abs(rate_dt) < 1.0e-3, rate_dt, -jnp.expm1(-rate_dt)) * self.landau_band
         kx, ky = self.spectral.kx[:, None], self.spectral.ky[None, :]
         k_dot_e = k_dot(e_k, self.spectral.kx, self.spectral.ky)
         e_long = [kx * k_dot_e * self.spectral.one_over_k_sq, ky * k_dot_e * self.spectral.one_over_k_sq]
@@ -174,7 +180,7 @@ class FDCombinedSolver(CoupledLight):
             step = jnp.round(t / self.dt).astype(int)
             key = jax.random.fold_in(self.spectral.noise_key, step)
             phases = 2.0 * np.pi * jax.random.uniform(key, (self.nx, self.ny))
-            phi_kick = self.noise_kick_lw * jnp.exp(1j * phases) * band
+            phi_kick = self.noise_kick_lw * jnp.exp(1j * phases)
             comps = [comps[0] - 1j * kx * phi_kick, comps[1] - 1j * ky * phi_kick]
         if e_k.shape[-1] == 3:
             comps.append(e_k[..., 2])

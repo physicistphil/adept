@@ -370,6 +370,55 @@ def test_noise_streams_decorrelated_across_seeds():
         assert not np.array_equal(n1, n0), f"seed-1 noise equals seed-0 noise shifted by {shift} steps"
 
 
+def test_srs_source_is_band_limited_like_lpse():
+    """LPSE ``updatePotentialWithSrsSource_fft`` adds the SRS source only where
+    ``!insideAntiAliasRegion && 0 < |K| < lw.maxWavenumber`` and zeroes the potential elsewhere
+    (ZakharovSolver.cpp:3892-3897; physics review 2026-11-16, B23). With a 0.6 anti-aliasing
+    rectangle and lw.maxWavenumber = 2.5 k0, random pump and Raman fields: the source is exactly zero
+    outside that band (the old source filled the whole grid), and inside it is the FFT of
+    ``prefactor (n / n_env) E0 . E1*`` with the x-space source mask (rtol 1e-12)."""
+    from jax import numpy as jnp
+
+    from adept._lpse2d_cpp.core.epw import SpectralEPWSolver
+    from adept._lpse2d_cpp.helpers import (
+        get_density_profile,
+        get_derived_quantities,
+        get_solver_quantities,
+        write_units,
+    )
+
+    cfg = _load_cfg()
+    cfg["grid"]["xmax"] = "6.4um"
+    cfg["terms"]["epw"]["source"]["noise"] = False
+    cfg["terms"]["epw"]["max_wavenumber"] = 2.5
+    write_units(cfg)
+    cfg = get_derived_quantities(cfg)
+    cfg["grid"] = get_solver_quantities(cfg)
+    cfg["grid"]["background_density"] = get_density_profile(cfg)
+    epw = SpectralEPWSolver(cfg)
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    rng = np.random.default_rng(11)
+
+    def field():
+        return jnp.asarray(rng.normal(size=(nx, ny, 2)) + 1j * rng.normal(size=(nx, ny, 2)))
+
+    E0, E1 = field(), field()
+    got = np.asarray(epw.calc_srs_source(E0, E1))
+
+    derived = cfg["units"]["derived"]
+    k = np.sqrt(np.asarray(cfg["grid"]["kx"])[:, None] ** 2 + np.asarray(cfg["grid"]["ky"])[None, :] ** 2)
+    band = (
+        (np.asarray(cfg["grid"]["light_low_pass_filter_grid"]) > 0) & (k > 0) & (k < 2.5 * derived["w0"] / derived["c"])
+    )
+    assert band.sum() > 10 and (~band).sum() > 10 and k.max() > 2.5 * derived["w0"] / derived["c"]
+    x_space = epw.srs_prefactor * np.asarray(epw.background_density) / epw.envelope_density
+    x_space = epw.source_mask * x_space * np.sum(np.asarray(E0) * np.conj(np.asarray(E1)), axis=-1)
+    want = np.fft.fft2(x_space)
+    assert np.all(got[~band] == 0.0)
+    assert np.min(np.abs(want[~band])) > 0.0
+    np.testing.assert_allclose(got[band], want[band], rtol=1e-12, atol=1e-12 * np.abs(want).max())
+
+
 if __name__ == "__main__":
     test_srs_seed_propagation()
     test_srs_growth_rate()

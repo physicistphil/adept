@@ -664,7 +664,10 @@ class SpectralEPWSolver:
         # (1 + backgroundDensityPerturbation) = n / n_envelope
         source = self.srs_prefactor * self.background_density / self.envelope_density * E0_dot_E1
 
-        return jnp.fft.fft2(self.source_mask * source)
+        # LPSE updatePotentialWithSrsSource_fft adds the source only on the retained EPW band
+        # (anti-aliased, 0 < |k| < lw.maxWavenumber) and zeroes the potential elsewhere
+        # (ZakharovSolver.cpp:3892-3897); the potential is already zero there after the re-projection
+        return jnp.fft.fft2(self.source_mask * source) * self.low_pass_filter * self.zero_mask
 
     def get_noise(self, t: float) -> Array:
         """

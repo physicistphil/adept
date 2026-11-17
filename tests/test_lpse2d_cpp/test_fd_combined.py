@@ -211,6 +211,83 @@ def test_langmuir_step_grows_negative_rates_exponentially():
         np.testing.assert_allclose(out, factor * np.asarray(e_l), rtol=1e-12, atol=1e-14)
 
 
+def test_langmuir_step_bands_follow_lpse():
+    """LwSolver::advanceLW_combinedTPDandSRS_FD damps every k > 0 mode outside the anti-aliased region
+    (LwSolver.cpp:815) -- lw.maxWavenumber does not limit the Landau step on this path -- and adds
+    -i k phi_noise wherever the noise potential is nonzero (LwSolver.cpp:859-873), the kick's own
+    support, not narrowed by the spectral light cap (physics review 2026-11-16, B23 sweep). A
+    longitudinal mode above terms.epw.max_wavenumber = 0.5 k0, inside the 0.6 rectangle, is damped
+    by exp(-gamma dt) (rtol 1e-12; the old step left it undamped); with terms.light.max_wavenumber
+    = 0.3 k0 the flat noise reaches every mode of the kick spectrum (the old step cut it at 0.3 k0) and
+    nothing else (round-off, 1e-12 of the largest kick)."""
+    from adept._lpse2d_cpp.core.fd_combined import FDCombinedSolver
+    from adept._lpse2d_cpp.helpers import (
+        get_density_profile,
+        get_derived_quantities,
+        get_solver_quantities,
+        write_units,
+    )
+
+    def finish(cfg):
+        write_units(cfg)
+        cfg = get_derived_quantities(cfg)
+        cfg["grid"] = get_solver_quantities(cfg)
+        cfg["grid"]["background_density"] = get_density_profile(cfg)
+        return cfg
+
+    with open("tests/test_lpse2d_cpp/configs/tpd.yaml") as fi:
+        base = deepcopy(yaml.safe_load(fi))
+    base["density"] = {"basis": "uniform", "val": 0.2}
+    base["units"]["envelope density"] = 0.2
+    base["grid"].update(
+        {
+            "boundary_width": "0.6um",
+            "dt": "1fs",
+            "dx": "0.1um",
+            "xmax": "6.4um",
+            "tmax": "10fs",
+            "ymax": "0.05um",
+            "ymin": "-0.05um",
+            "low_pass_filter": 0.6,
+        }
+    )
+    base["terms"]["epw"]["boundary"] = {"x": "absorbing", "y": "periodic"}
+    base["terms"]["epw"]["damping"] = {"collisions": False, "landau": True}
+    base["terms"]["epw"]["source"].update({"noise": False, "tpd": True, "srs": True})
+    base["terms"]["epw"]["solver"] = "combined"
+    base["terms"]["epw"]["max_wavenumber"] = 0.5
+    base["terms"]["light"] = {"solver": "fd", "pump_depletion": True}
+
+    capped_cfg = finish(deepcopy(base))
+    solver = FDCombinedSolver(capped_cfg)
+    d = capped_cfg["units"]["derived"]
+    k0 = d["w0"] / d["c"]
+    k, e_l = _wave(capped_cfg, 12, 0)
+    assert 0.5 * k0 < k and capped_cfg["grid"]["light_low_pass_filter_grid"][12, 0] > 0
+    assert capped_cfg["grid"]["low_pass_filter_grid"][12, 0] == 0  # outside the EPW band
+    gamma = jnp.full(solver.spectral.k_sq.shape, 50.0)
+    out = np.asarray(solver.langmuir_step(0.0, e_l, gamma))
+    np.testing.assert_allclose(out, np.exp(-50.0 * solver.dt) * np.asarray(e_l), rtol=1e-12, atol=1e-14)
+
+    noisy = deepcopy(base)
+    del noisy["terms"]["epw"]["max_wavenumber"]
+    noisy["terms"]["epw"]["source"].update(
+        {"noise": True, "noise_model": "flat", "noise_amplitude": 1.0, "noise_seed": 3}
+    )
+    noisy["terms"]["light"]["max_wavenumber"] = 0.3
+    noisy = finish(noisy)
+    solver = FDCombinedSolver(noisy)
+    nx, ny = noisy["grid"]["nx"], noisy["grid"]["ny"]
+    zero = jnp.zeros((nx, ny, 3), dtype=jnp.complex128)
+    kicked = np.fft.fft2(np.asarray(solver.langmuir_step(0.0, zero, jnp.zeros((nx, ny)))), axes=(0, 1))
+    support = np.asarray(solver.noise_kick_lw) > 0
+    kx = np.abs(np.asarray(noisy["grid"]["kx"]))[:, None] * np.ones((1, ny))
+    assert np.any(support & (kx >= 0.3 * k0))
+    scale = np.abs(kicked).max()
+    assert np.all(np.abs(kicked[..., 0][support]) > 1e-6 * scale)
+    assert np.abs(kicked[~support]).max() < 1e-12 * scale
+
+
 def test_fd_combined_light_step_respects_the_combined_field_bound_with_the_sources_off():
     """The FD combined solver evolves E1 (light operator + Bohm-Gross grad-div) with TPD and SRS both
     off too, so setup must sub-cycle the light to the combined field's stability bound then as well
