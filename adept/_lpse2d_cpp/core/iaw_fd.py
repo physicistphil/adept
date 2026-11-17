@@ -271,7 +271,6 @@ class FDIonAcoustic:
         # the coarse grid's actual retained band (the anti-aliasing rectangle or disc, iaw.max_wavenumber,
         # k != 0) mapped mode by mode: LPSE rescales the anti-aliasing range per axis on the fine grid
         # (IawSolver.cpp:312), the same physical rectangle; a radius would admit its excluded axis modes
-        k_max_x = float(np.max(np.abs(np.asarray(grid["kx"]))))
         coarse_filter = np.asarray(
             grid.get("iaw_low_pass_filter_grid", grid["low_pass_filter_grid"]) * grid["zero_mask"]
         )
@@ -296,10 +295,11 @@ class FDIonAcoustic:
         # outside that disc is zeroed when the noise is on
         self.noise = bool(iaw.noise_enabled) and self.kspace_step
         if self.noise:
-            k_noise = float(grid.get("low_pass_filter", 1.0)) * k_max_x
-            # LPSE's noise disc within the retained band (the coarse mask and terms.iaw.max_wavenumber,
-            # as the spectral solver's noise), so the kick cannot repopulate modes the band excludes
-            noise_band = (np.sqrt(fk_sq) < k_noise) & band
+            # LPSE's noise disc within the retained band (the coarse mask and terms.iaw.max_wavenumber),
+            # the spectral solver's support (iaw_noise_band), so the kick cannot repopulate modes the band excludes
+            from adept._lpse2d_cpp.core.iaw import iaw_noise_band
+
+            noise_band = iaw_noise_band(cfg, fk_sq, band)
             amplitude = float(opts.get("noise_amplitude", 1.0))
             kick = amplitude * float(self.fnx * self.fny) * np.sqrt(np.expm1(2.0 * self.dt_damp * (gamma + nu_coll)))
             self.noise_kick = jnp.asarray(np.where(noise_band, kick, 0.0))

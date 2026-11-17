@@ -310,3 +310,51 @@ def test_iaw_stride_applies_the_absorber_over_the_whole_iaw_step():
     w_one = np.asarray(_run(one, dict(state), 24)["iaw_velocity_divergence"])
     w_two = np.asarray(_run(two, dict(state), 12)["iaw_velocity_divergence"])
     np.testing.assert_allclose(w_two, w_one, rtol=0, atol=1e-2 * amplitude)
+
+
+@pytest.mark.parametrize("solver", ["spectral", "explicit"])
+def test_iaw_noise_lives_on_lpse_disc_and_zeroes_div_v_outside(solver):
+    """Review 2026-11-16 B12: LPSE's IawSolver::addNoise, called by the spectral and fd paths alike, kicks
+    div v on the disc |k| < (1 - antiAliasing.range) pi / h, k != 0 (IawSolver.cpp:2570-2582) and zeroes div v
+    outside it (:2601-2603); Nelf is left alone. adept kicked the whole retained rectangle, 4/pi = 1.27x the
+    modes with dx = dy. Exact mode sets (no tolerance): after one step from a state holding one disc mode and
+    one corner mode (inside the rectangle, outside the disc) in both n and w, the kick covers exactly LPSE's
+    disc, the corner's w is zero and its n is not."""
+    from adept._lpse2d_cpp.core.iaw import IonAcousticWave
+
+    aa = 1.0 / 3.0
+    cfg = _make_cfg(
+        solver=solver,
+        dt="0.2fs",
+        landau=0.1,
+        collisions=0.02,
+        noise=True,
+        noise_amplitude=1.0e-6,
+        noise_seed=3,
+        grid_extra={"ymax": "1.6um", "ymin": "-1.6um", "low_pass_filter": 1.0 - aa, "dealias": "rectangular"},
+    )
+    grid = cfg["grid"]
+    nx, ny = grid["nx"], grid["ny"]
+    assert ny > 1 and grid["dy"] == pytest.approx(grid["dx"], rel=1e-12)
+    kx, ky = np.asarray(grid["kx"]), np.asarray(grid["ky"])
+    k = np.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2)
+    rectangle = np.asarray(grid["low_pass_filter_grid"]) > 0.0
+    disc = (k < (1.0 - aa) * np.pi / grid["dx"]) & (k > 0.0)  # IawSolver.cpp:2570, h = Lx / (Nx - 1) = dx
+    corner = rectangle & ~disc & (k > 0.0)
+    assert corner.sum() > 0.2 * disc.sum()  # the rectangle's corners are a sizeable extra set
+    solver_ = IonAcousticWave(cfg)
+    np.testing.assert_array_equal(np.asarray(solver_.noise_kick) > 0.0, disc & rectangle)
+    # a state with one disc mode and one corner mode in both fields
+    i_disc = np.argwhere(disc & rectangle)[0]
+    i_corner = np.argwhere(corner)[0]
+    seed_k = np.zeros((nx, ny), dtype=complex)
+    seed_k[tuple(i_disc)] = seed_k[tuple(i_corner)] = 1.0e-3 * nx * ny
+    field = np.real(np.fft.ifft2(seed_k))
+    state = {**_zero_fields(cfg), "iaw_density": jnp.asarray(field), "iaw_velocity_divergence": jnp.asarray(field)}
+    out = solver_(state, 0.0)
+    w_k = np.fft.fft2(np.asarray(out["iaw_velocity_divergence"]))
+    n_k = np.fft.fft2(np.asarray(out["iaw_density"]))
+    assert np.abs(w_k[corner]).max() < 1e-12 * np.abs(seed_k).max()
+    assert np.abs(w_k[disc & rectangle]).min() > 0.0
+    if solver == "spectral":
+        assert np.abs(n_k[tuple(i_corner)]) > 0.5 * np.abs(seed_k[tuple(i_corner)]) / 2  # Nelf keeps its corner mode

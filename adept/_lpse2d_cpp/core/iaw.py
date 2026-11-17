@@ -83,6 +83,21 @@ def iaw_feedback_factor(cfg: dict, wave: str = "epw"):
     return jnp.asarray(np.asarray(cfg["grid"]["background_density"]) / float(cfg["units"]["envelope density"]))
 
 
+def iaw_noise_band(cfg: dict, k_sq: np.ndarray, band: np.ndarray) -> np.ndarray:
+    """LPSE's IAW noise support (``IawSolver::addNoise``, ``IawSolver.cpp:2570-2582``): the disc
+    ``|k| < (1 - antiAliasing.range) pi / h`` of the EPW grid (``grid.low_pass_filter * pi / dx``), ``k != 0``,
+    within the retained IAW ``band`` (the anti-aliasing mask and ``terms.iaw.max_wavenumber``). Every IAW
+    solver draws its noise here and zeroes ``div v`` outside it while the noise is on (LPSE's spectral and fd
+    paths both call ``addNoise``), so the thermal source is isotropic and the same for every solver; with
+    ``grid.dealias: rectangular`` and ``dx = dy`` the rectangle's corners hold ``4/pi - 1`` = 27 % more modes.
+    ``k_sq``: the solver's ``k^2`` grid; boolean, FFT order."""
+    lpf = float(cfg["grid"].get("low_pass_filter", 1.0))
+    # adept reads a non-positive low_pass_filter as no cutoff (helpers.get_solver_quantities)
+    k_noise = lpf * np.pi / float(cfg["grid"]["dx"]) if lpf > 0.0 else np.inf
+    k_sq = np.asarray(k_sq)
+    return (np.sqrt(k_sq) < k_noise) & (k_sq > 0.0) & np.asarray(band, dtype=bool)
+
+
 def _Q_kev(value) -> float:
     from adept._lpse2d_cpp.helpers import _Q
 
@@ -261,16 +276,18 @@ class IonAcousticWave:
         # IAW noise (LPSE IawSolver::addNoise): random-phase source on the velocity
         # divergence with the fluctuation-dissipation amplitude
         #     A N sqrt(exp(2 dt (gamma_k + nu)) - 1)
-        # on the retained band; LPSE refuses it without damping
-        self.noise_enabled = bool(iaw.get("noise", False))
+        # on LPSE's noise disc (iaw_noise_band), outside which div v is zeroed while the noise is on;
+        # LPSE refuses it without damping and adds none for A <= 0 (IawSolver.cpp:2553)
+        amplitude = float(iaw.get("noise_amplitude", 1.0))
+        self.noise_enabled = bool(iaw.get("noise", False)) and amplitude > 0.0
         if self.noise_enabled:
-            amplitude = float(iaw.get("noise_amplitude", 1.0))
             total = np.asarray(self.landau_rate) + self.nu_coll
-            band = np.asarray(self.filter) > 0.0
+            band = iaw_noise_band(cfg, k_sq_np, np.asarray(self.filter) > 0.0)
             if not np.any(total[band] > 0.0):
                 raise ValueError("terms.iaw.noise requires IAW damping (landau and/or collisions)")
             kick = amplitude * float(self.nx * self.ny) * np.sqrt(np.expm1(2.0 * self.dt * total))
             self.noise_kick = jnp.asarray(np.where(band, kick, 0.0))
+            self.noise_band = jnp.asarray(band.astype(np.float64))
             seed = iaw.get("noise_seed")
             self.noise_key = jax.random.PRNGKey(int(seed) if seed is not None else 271828)
         else:
@@ -463,7 +480,7 @@ class IonAcousticWave:
         velocity_k = jnp.fft.fft2(velocity_divergence)
         velocity_k = velocity_k * jnp.exp(-2.0 * self.landau_rate * self.dt) * self.collisional_w_factor * self.filter
         if self.noise_enabled:
-            velocity_k = velocity_k + self.get_noise(t)
+            velocity_k = (velocity_k + self.get_noise(t)) * self.noise_band
         velocity_divergence = jnp.real(jnp.fft.ifft2(velocity_k)) * self.boundary
 
         density = y["iaw_density"] - self.dt * velocity_divergence
@@ -489,7 +506,8 @@ class IonAcousticWave:
                 self.thermal_filamentation_source(y["epw"], y["E0"], y["E1"], y["iaw_density"])
             )
         if self.noise_enabled:
-            w_new = w_new + self.get_noise(t)
+            # LPSE addNoise zeroes div v (not Nelf) outside the noise disc (IawSolver.cpp:2601-2603)
+            w_new = (w_new + self.get_noise(t)) * self.noise_band
 
         n_new = n_new * self.filter
         w_new = w_new * self.filter
