@@ -414,7 +414,9 @@ def test_windowed_dissipation_is_the_energy_the_damping_step_removes():
         damped = SpectralEPWSolver(cfg).windowed_landau_damping(phi_k, jnp.asarray(gamma))
         damped = np.asarray(damped) * np.exp(-d.get("nu_coll", 0.0) * dt)
         removed = np.sum(k_sq * np.abs(np.asarray(phi_k)) ** 2) - np.sum(k_sq * np.abs(damped) ** 2)
-        factor = 2.0 * (2.0 - np.asarray(grid["background_density"]) / cfg["units"]["envelope density"])
+        factor = (
+            2.0 * cfg["units"]["envelope density"] / np.asarray(grid["background_density"])
+        )  # 2 n_env / n (review C3)
         assert np.ptp(factor) == 0.0
         prefactor = 0.25 * grid["dx"] * d["x_norm"] * d["e_norm"] ** 2
         return prefactor * float(factor.flat[0]) * removed / (dt * nx * ny**2), prefactor * float(factor.flat[0])
@@ -488,7 +490,7 @@ def test_windowed_dissipation_on_a_ramp_is_the_weighted_electric_energy_loss():
     _, _, _, single = run(1)
     grid, d = cfg["grid"], cfg["units"]["derived"]
     dt = grid["dt"]
-    factor = 2.0 * (2.0 - np.asarray(grid["background_density"]) / cfg["units"]["envelope density"])
+    factor = 2.0 * cfg["units"]["envelope density"] / np.asarray(grid["background_density"])  # 2 n_env / n (review C3)
     assert np.ptp(factor) > 0.0  # a ramp, not a constant factor
 
     solver = SpectralEPWSolver(cfg)
