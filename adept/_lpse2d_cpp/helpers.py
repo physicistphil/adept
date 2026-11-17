@@ -2470,12 +2470,29 @@ def get_default_save_func(cfg):
     thomson_masks = []
     k0_vac = derived["w0"] / derived["c"]
     for probe in thomson_probes:
-        if probe.get("field", "epw") == "iaw" and not iaw_on:
+        field = probe.get("field", "epw")
+        if field not in ("epw", "iaw"):
+            raise ValueError(f"save.thomson probe field must be 'epw' or 'iaw', got {field!r}")
+        if field == "iaw" and not iaw_on:
             raise ValueError("save.thomson probe on the IAW density needs terms.iaw.active")
         kxp, kyp = (float(v) * k0_vac for v in probe["k"])
-        band = float(probe.get("bandwidth", 0.1)) * k0_vac
-        dist = np.sqrt((np.asarray(kx)[:, None] - kxp) ** 2 + (np.asarray(ky)[None, :] - kyp) ** 2)
-        thomson_masks.append(jnp.asarray(dist < band))
+        bandwidth = float(probe.get("bandwidth", 0.1))
+        if bandwidth < 0.0:
+            raise ValueError(f"save.thomson probe bandwidth must be >= 0, got {bandwidth}")
+        dist_sq = (np.asarray(kx)[:, None] - kxp) ** 2 + (np.asarray(ky)[None, :] - kyp) ** 2
+        # LPSE ThomsonScattering::getKradiusSq / collectRho: the inclusive disc |k - k_probe|^2 <= (bw k0)^2,
+        # widened to 1.01 x the nearest grid point's squared distance when it holds none; the 1e-9 slack
+        # keeps a grid point on the circle inside
+        radius_sq = (bandwidth * k0_vac) ** 2
+        if not np.any(dist_sq <= radius_sq * (1.0 + 1e-9)):
+            radius_sq = 1.01 * float(dist_sq.min())
+        mask = dist_sq <= radius_sq * (1.0 + 1e-9)
+        thomson_masks.append((jnp.asarray(mask), float(mask.sum())))
+    # LPSE's Thomson EPW quantity is rho_k = K^2 phi_k scaled to the envelope density
+    # (rhoNormalizationFactor / NoOverNc, ParameterManager.cpp:1248, ThomsonScattering.cpp:257):
+    # e k^2 phi_k / (m_e wp0^2) = (div E)_k / (4 pi e n_env), the charge-density fluctuation in units of
+    # e n_env (= -delta n_e / n_env), unnormalized-FFT convention
+    thomson_rho_factor = derived["e"] / (derived["me"] * derived["wp0"] ** 2)
 
     # OSIRIS-normalized EPW energy: W = 1/2 * dx * sum_x <e^2>_cycle with fields in
     # me*c*w0/e and lengths in c/w0 (osiris_lpi/epw_growth.py convention). The complex
@@ -2712,16 +2729,20 @@ def get_default_save_func(cfg):
             out["iaw_density_sq"] = jnp.mean(iaw_density**2)
             out["iaw_density_abs_max"] = jnp.max(jnp.abs(iaw_density))
 
-        # Thomson-scattering probes (LPSE thomsonScattering.N: wavevector.lw / .iaw, bandwidth):
-        # the complex amplitude and the power of the EPW potential (or the IAW density) in the
-        # k-window |k - k_probe| < bandwidth k0, as a time series for later spectral analysis
-        for i_probe, mask in enumerate(thomson_masks):
+        # Thomson-scattering probes (LPSE thomsonScattering.N: wavevector.lw / .iaw, bandwidth): the mean
+        # over the k-disc of the EPW charge density rho_k = e k^2 phi_k / (m_e wp0^2) (units of e n_env),
+        # or of the IAW density FFT(delta n / n_b) -- LPSE's Thomson file values -- and the mean spectral
+        # power there, as a time series for later spectral analysis
+        for i_probe, (mask, n_points) in enumerate(thomson_masks):
             field = "iaw" if thomson_probes[i_probe].get("field", "epw") == "iaw" else "epw"
-            spectrum = jnp.fft.fft2(y["iaw_density"]) if field == "iaw" else phi_k
-            amplitude = jnp.sum(jnp.where(mask, spectrum, 0.0))
+            if field == "iaw":
+                spectrum = jnp.fft.fft2(y["iaw_density"])
+            else:
+                spectrum = thomson_rho_factor * k_sq_default * phi_k
+            amplitude = jnp.sum(jnp.where(mask, spectrum, 0.0)) / n_points
             out[f"thomson_{i_probe}_re"] = jnp.real(amplitude)
             out[f"thomson_{i_probe}_im"] = jnp.imag(amplitude)
-            out[f"thomson_{i_probe}_power"] = jnp.sum(jnp.where(mask, jnp.abs(spectrum) ** 2, 0.0))
+            out[f"thomson_{i_probe}_power"] = jnp.sum(jnp.where(mask, jnp.abs(spectrum) ** 2, 0.0)) / n_points
 
         if hpe_on:
             u = y["u_e"]

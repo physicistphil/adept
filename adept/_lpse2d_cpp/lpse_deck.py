@@ -1263,6 +1263,9 @@ def translate_parms(
     light_spectrum = _light_spectrum_probes(parms, g, report, laser_evolves, raman_on)
     if light_spectrum:
         cfg["save"]["light_spectrum"] = light_spectrum
+    thomson = _thomson_probes(parms, g, report, _bool(g("lw.enable")), iaw is not None)
+    if thomson:
+        cfg["save"]["thomson"] = thomson
     if iaw is not None:
         cfg["terms"]["iaw"] = iaw
     if hpe is not None:
@@ -1325,6 +1328,37 @@ def _light_spectrum_probes(parms: dict, g, report: dict, laser_evolves: bool, ra
             if len(lo) > 1 and len(hi) > 1:
                 probe["y"] = [f"{lo[1]}um", f"{hi[1]}um"]
             probes.append(probe)
+    return probes
+
+
+def _thomson_probes(parms: dict, g, report: dict, lw_on: bool, iaw_on: bool) -> list[dict]:
+    """``thomsonScattering.N.{wavevector.lw, wavevector.iaw, bandwidth}`` (``ThomsonScattering::readParameters``;
+    ``thomsonScattering.nThomsonScattering`` gives the count) -> ``save.thomson`` entries, one per collected
+    field (``epw`` for ``wavevector.lw``, ``iaw`` for ``wavevector.iaw``), in deck order. LPSE enables a probe
+    by its output ``file`` and disables a negative bandwidth; ``bandwidth`` defaults to 0 (the nearest grid
+    point). adept records the probes every step, not every ``thomsonScattering.samplePeriod``."""
+    probes = []
+    count = int(float(g("thomsonScattering.nThomsonScattering", "0")))
+    for n in range(1, count + 1):
+        prefix = f"thomsonScattering.{n}"
+        if not str(g(f"{prefix}.file", "")).strip():
+            continue
+        bandwidth = float(g(f"{prefix}.bandwidth", "0"))
+        if bandwidth < 0.0:
+            continue
+        for key, field, active in (("lw", "epw", lw_on), ("iaw", "iaw", iaw_on)):
+            if f"{prefix}.wavevector.{key}" not in parms:
+                continue
+            if not active:
+                report["notes"].append(f"{prefix}.wavevector.{key}: that wave is not evolved; probe skipped")
+                continue
+            k = list(_floats(parms[f"{prefix}.wavevector.{key}"])) + [0.0, 0.0, 0.0]
+            if k[2] != 0.0:
+                report["unsupported"].append(f"{prefix}.wavevector.{key}: k_z != 0 has no grid mode in 2-D")
+            report["notes"].append(
+                f"{prefix}.wavevector.{key} -> save.thomson[{len(probes)}] (series thomson_{len(probes)}_*)"
+            )
+            probes.append({"k": [k[0], k[1]], "bandwidth": bandwidth, "field": field})
     return probes
 
 

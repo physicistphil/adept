@@ -95,25 +95,143 @@ def test_poynting_counts_the_out_of_plane_component(tmp_path):
         np.testing.assert_allclose(fields["s0_x"].values[0, 4:-4, :], v_g * expected, rtol=2e-2)
 
 
-def test_thomson_probe_picks_the_mode_in_its_window():
-    cfg = _cfg(thomson=[{"k": [0.5, 0.0], "bandwidth": 0.05}, {"k": [-0.5, 0.0], "bandwidth": 0.05}])
-    save_func = cfg["save"]["default"]["func"]
-    d = cfg["units"]["derived"]
+def _thomson_out(cfg, phi_k, iaw_density=None):
     nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
-    kx = np.asarray(cfg["grid"]["kx"])
-    k_probe = 0.5 * d["w0"] / d["c"]
-    ix = int(np.argmin(np.abs(kx - k_probe)))
-    phi_k = jnp.zeros((nx, ny), dtype=jnp.complex128).at[ix, 0].set(3.0 + 4.0j)
     y = {
         "epw": phi_k,
         "E0": jnp.zeros((nx, ny, 2), dtype=jnp.complex128),
         "E1": jnp.zeros((nx, ny, 2), dtype=jnp.complex128),
     }
-    out = save_func(0.0, y, {"drivers": {k: v["derived"] for k, v in cfg["drivers"].items()}})
-    np.testing.assert_allclose(float(out["thomson_0_re"]), 3.0)
-    np.testing.assert_allclose(float(out["thomson_0_im"]), 4.0)
-    np.testing.assert_allclose(float(out["thomson_0_power"]), 25.0)
+    if iaw_density is not None:
+        y["iaw_density"] = iaw_density
+    return cfg["save"]["default"]["func"](0.0, y, {"drivers": {k: v["derived"] for k, v in cfg["drivers"].items()}})
+
+
+def test_thomson_probe_is_lpse_rho_averaged_over_its_window():
+    """LPSE's Thomson EPW value (physics review 2026-11-16, B8): rho_k = K^2 pots_k times
+    rhoNormalizationFactor / NoOverNc (ThomsonScattering::collectRho, ParameterManager.cpp:1248), summed
+    over the inclusive disc |K - K_probe|^2 <= (bandwidth K0)^2 and divided by its number of grid points
+    (ThomsonScattering::reduce). Reference: that chain in ZAK units (ZakUnits, a transcription of
+    ParameterManager) applied to the adept potential converted to ZAK; rtol 1e-6 (the ZAK constants
+    are rounded the way LPSE's are, about 1e-7). The probe at 0.5 k0 with bandwidth 0.05 k0 holds 4
+    grid points here; the old probe summed phi_k itself."""
+    from adept._lpse2d_cpp.lpse_deck import ZakUnits
+
+    cfg = _cfg(thomson=[{"k": [0.5, 0.0], "bandwidth": 0.05}, {"k": [-0.5, 0.0], "bandwidth": 0.05}])
+    d = cfg["units"]["derived"]
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    kx = np.asarray(cfg["grid"]["kx"])
+    k0 = d["w0"] / d["c"]
+    ix = int(np.argmin(np.abs(kx - 0.5 * k0)))
+    phi_k = jnp.zeros((nx, ny), dtype=jnp.complex128).at[ix, 0].set(3.0 + 4.0j)
+    out = _thomson_out(cfg, phi_k)
+
+    zak = ZakUnits.from_cfg(cfg)
+    k_zak = kx[ix] / zak.zak_per_um
+    pots_zak = (3.0 + 4.0j) / zak.potential_zak_to_adept
+    n_points = int(
+        np.sum((kx[:, None] - 0.5 * k0) ** 2 + np.asarray(cfg["grid"]["ky"])[None, :] ** 2 <= (0.05 * k0) ** 2)
+    )
+    assert n_points == 4
+    rho = k_zak**2 * pots_zak * zak.rho_normalization_factor / float(cfg["units"]["envelope density"]) / n_points
+    np.testing.assert_allclose(float(out["thomson_0_re"]), rho.real, rtol=1e-6)
+    np.testing.assert_allclose(float(out["thomson_0_im"]), rho.imag, rtol=1e-6)
+    np.testing.assert_allclose(float(out["thomson_0_power"]), abs(rho) ** 2 * n_points, rtol=1e-6)
     assert float(out["thomson_1_power"]) == 0.0
+
+
+def test_thomson_window_is_inclusive_and_never_empty():
+    """LPSE ThomsonScattering::getKradiusSq: grid points on the circle count (<=), and a window with no
+    grid point is widened to 1.01 x the nearest point's squared distance. A probe on a grid node with a
+    radius of exactly two x spacings (= one y spacing here) holds 7 points (the strict disc held 3); a
+    zero bandwidth off the grid holds the single nearest point. Exact counts; the amplitude is the
+    mean of rho over them (rtol 1e-12)."""
+    cfg0 = _cfg()
+    kx = np.asarray(cfg0["grid"]["kx"])
+    ky = np.asarray(cfg0["grid"]["ky"])
+    d = cfg0["units"]["derived"]
+    k0 = d["w0"] / d["c"]
+    dkx, dky = kx[1] - kx[0], ky[1] - ky[0]
+    np.testing.assert_allclose(2.0 * dkx, dky, rtol=1e-12)
+    cfg = _cfg(
+        thomson=[
+            {"k": [18 * dkx / k0, 0.0], "bandwidth": 2.0 * dkx / k0},
+            {"k": [18.3 * dkx / k0, 0.0], "bandwidth": 0.0},
+        ]
+    )
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    rng = np.random.default_rng(4)
+    phi_k = jnp.asarray(rng.normal(size=(nx, ny)) + 1j * rng.normal(size=(nx, ny)))
+    out = _thomson_out(cfg, phi_k)
+    rho = d["e"] / (d["me"] * d["wp0"] ** 2) * (kx[:, None] ** 2 + ky[None, :] ** 2) * np.asarray(phi_k)
+    window = [(18 + i, 0) for i in (-2, -1, 0, 1, 2)] + [(18, 1), (18, ny - 1)]
+    want = np.mean([rho[i, j] for i, j in window])
+    np.testing.assert_allclose(complex(out["thomson_0_re"] + 1j * out["thomson_0_im"]), want, rtol=1e-12)
+    np.testing.assert_allclose(complex(out["thomson_1_re"] + 1j * out["thomson_1_im"]), rho[18, 0], rtol=1e-12)
+
+
+def test_thomson_iaw_probe_is_the_mean_density_spectrum():
+    """field: iaw -- LPSE collectNelf sums Nelf_k (delta n / n_b, adept's iaw_density) over the same
+    inclusive disc and divides by its point count (rtol 1e-12)."""
+    with open("tests/test_lpse2d_cpp/configs/tpd.yaml") as fi:
+        raw = deepcopy(yaml.safe_load(fi))
+    raw["density"] = {"basis": "uniform", "val": 0.2}
+    raw["grid"].update({"dx": "0.1um", "xmax": "12.8um", "ymax": "3.2um", "ymin": "-3.2um", "dt": "1fs", "tmax": "2fs"})
+    raw["terms"]["epw"]["source"].update({"noise": False, "tpd": False})
+    raw["terms"]["iaw"] = {"active": True, "solver": "spectral", "damping": {"landau": 0.0}}
+    raw["save"]["fields"].pop("x", None)
+    raw["save"]["fields"].pop("y", None)
+    raw["save"]["thomson"] = [{"k": [0.5, 0.0], "bandwidth": 0.05, "field": "iaw"}]
+    cfg = _finish(raw)
+    nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
+    kx = np.asarray(cfg["grid"]["kx"])
+    ky = np.asarray(cfg["grid"]["ky"])
+    d = cfg["units"]["derived"]
+    k0 = d["w0"] / d["c"]
+    rng = np.random.default_rng(8)
+    density = 1e-3 * rng.normal(size=(nx, ny))
+    out = _thomson_out(cfg, jnp.zeros((nx, ny), dtype=jnp.complex128), jnp.asarray(density))
+    window = (kx[:, None] - 0.5 * k0) ** 2 + ky[None, :] ** 2 <= (0.05 * k0) ** 2
+    spectrum = np.fft.fft2(density)
+    want = spectrum[window].mean()
+    np.testing.assert_allclose(complex(out["thomson_0_re"] + 1j * out["thomson_0_im"]), want, rtol=1e-12)
+    np.testing.assert_allclose(float(out["thomson_0_power"]), np.mean(np.abs(spectrum[window]) ** 2), rtol=1e-12)
+
+
+def test_translator_maps_the_thomson_probes():
+    """thomsonScattering.N (ThomsonScattering::readParameters): a probe with a file maps each of its
+    wavevectors (lw -> field epw, iaw -> field iaw) with the deck bandwidth (default 0); a probe without
+    a file, or with a negative bandwidth, is disabled in LPSE and skipped; an IAW wavevector without
+    IAWs is noted and skipped. Exact."""
+    from adept._lpse2d_cpp.lpse_deck import translate_parms
+
+    base = {
+        "grid.sizes": "20 5",
+        "grid.nodes": "201 51",
+        "laser.enable": "true",
+        "laser.wavelength": "0.351",
+        "lw.enable": "true",
+        "lw.envelopeDensity": "0.25",
+        "lw.spectral.dt": "0.002",
+        "simulation.time.end": "1",
+        "thomsonScattering.nThomsonScattering": "4",
+        "thomsonScattering.1.wavevector.lw": "1.2 0.2",
+        "thomsonScattering.1.wavevector.iaw": "0.5 0.0",
+        "thomsonScattering.1.bandwidth": "0.1",
+        "thomsonScattering.1.file": "thomson_1.dat",
+        "thomsonScattering.2.wavevector.lw": "-0.5 0.5",
+        "thomsonScattering.2.file": "thomson_2.dat",
+        "thomsonScattering.3.wavevector.lw": "0.7 0",
+        "thomsonScattering.4.wavevector.lw": "0.9 0",
+        "thomsonScattering.4.bandwidth": "-1",
+        "thomsonScattering.4.file": "thomson_4.dat",
+    }
+    cfg, report = translate_parms(base, run="thomson")
+    assert cfg["save"]["thomson"] == [
+        {"k": [1.2, 0.2], "bandwidth": 0.1, "field": "epw"},
+        {"k": [-0.5, 0.5], "bandwidth": 0.0, "field": "epw"},
+    ]
+    assert any("thomsonScattering.1.wavevector.iaw" in note for note in report["notes"])
 
 
 def _combined_cfg(envelope_density=0.25, density=0.2):
