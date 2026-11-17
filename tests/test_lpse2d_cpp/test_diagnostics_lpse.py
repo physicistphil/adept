@@ -454,13 +454,16 @@ def test_srs_couplings_conserve_the_factor_weighted_epw_energy():
     cfg = _srs_box({"basis": "uniform", "val": 0.15}, 0.2)
     nx, ny = cfg["grid"]["nx"], cfg["grid"]["ny"]
     epw = SpectralEPWSolver(cfg)
-    # the EPW source of uniform fields lands in the k = 0 mode: its coefficient, density factor included
-    a0, a1 = 0.7 - 0.2j, 0.3 + 0.5j
+    # a pump plane wave on an in-band mode m and a uniform Raman field: the source (a scalar times
+    # E0 . E1*, density factor included) lands in mode m -- not k = 0, which the source omits, as LPSE
+    a0, a1, m = 0.7 - 0.2j, 0.3 + 0.5j, 3
+    x = np.asarray(cfg["grid"]["x"])
     e0 = np.zeros((nx, ny, 3), dtype=np.complex128)
     e1 = np.zeros((nx, ny, 3), dtype=np.complex128)
-    e0[..., 1], e1[..., 1] = a0, a1
+    e0[..., 1] = (a0 * np.exp(1j * np.asarray(cfg["grid"]["kx"])[m] * (x - x[0])))[:, None]
+    e1[..., 1] = a1
     src = np.asarray(epw.calc_srs_source(jnp.asarray(e0), jnp.asarray(e1)))
-    p_eff = src[0, 0] / (nx * ny) / (a0 * np.conj(a1))
+    p_eff = src[m, 0] / (nx * ny) / (a0 * np.conj(a1))
     light = CoupledLight(_srs_box({"basis": "uniform", "val": 0.15}, 0.2, pump_depletion=True))
     a_dep, b_src = complex(light.srs_depletion_coeff0), complex(light.srs_coeff)
     rng = np.random.default_rng(5)
