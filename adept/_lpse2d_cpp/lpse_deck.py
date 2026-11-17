@@ -722,11 +722,24 @@ def translate_parms(
         light[target] = True if rate < 0 else (rate if rate > 0 else False)
     light["boundary_width"] = f"{widths['laser'][0]}um"
     light["raman_boundary_width"] = f"{widths['raman'][0]}um"
+    # each class's own absorber peak rate ({laser|raman}.evolution.abc.maxDampingRate, default 5e3 /ps,
+    # LightSolver.cpp:1317-1319): adept keeps the two separately
     light["boundary_max_rate"] = float(g("laser.evolution.abc.maxDampingRate", "5000"))
     light["raman_boundary_max_rate"] = float(g("raman.evolution.abc.maxDampingRate", "5000"))
     if "raman.spectral.maxWavenumber" in parms:
         light["max_wavenumber"] = float(parms["raman.spectral.maxWavenumber"])
-    abc_type = str(g("laser.evolution.abc.type", g("raman.evolution.abc.type", "exp"))).lower()
+    # {laser|raman}.evolution.abc.type is per class (LightSolver.cpp:1314); adept has one light absorber type,
+    # so only the evolved classes vote (the pump's when they differ, reported)
+    abc_types = {
+        cls: str(g(f"{cls}.evolution.abc.type", "exp")).lower()
+        for cls, on in (("laser", laser_evolves), ("raman", raman_on and raman_solver != "static"))
+        if on
+    }
+    abc_type = abc_types.get("laser", abc_types.get("raman", "exp"))
+    if len(set(abc_types.values())) > 1:
+        report["unsupported"].append(
+            f"{{laser|raman}}.evolution.abc.type differ ({abc_types}): adept has one light absorber type ({abc_type})"
+        )
     if abc_type == "pml":
         if light["solver"] == "fd":
             light["absorber"] = "pml"
@@ -740,9 +753,6 @@ def translate_parms(
             report["notes"].append("abc.type = pml with a spectral light solver: adept keeps the exp layer")
     elif abc_type not in ("exp",):
         report["unsupported"].append(f"abc.type = {abc_type} (exp or pml)")
-    light["boundary_max_rate"] = float(
-        g("raman.evolution.abc.maxDampingRate", g("laser.evolution.abc.maxDampingRate", "5000"))
-    )
     # LPSE default is false; the reference decks set it true
     light["transverse_source"] = _bool(
         g("raman.takeTransversePartOfSourceTerms", g("laser.takeTransversePartOfSourceTerms", "false"))

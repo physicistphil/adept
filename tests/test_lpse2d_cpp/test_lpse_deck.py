@@ -644,3 +644,38 @@ def test_translator_maps_the_iaw_noise_amplitude_from_zak_units(tmp_path):
     cfg, report = _translate_minimal(tmp_path, no_damping + "iaw.solver = fd;\n")
     assert cfg["terms"]["iaw"]["noise"] is False
     assert any("adds no noise" in n for n in report["notes"])
+
+
+def test_translator_keeps_each_light_class_absorber(tmp_path):
+    """Review 2026-11-16 B18: {laser|raman}.evolution.abc.maxDampingRate are per class (LightSolver.cpp:1317-1319)
+    and adept keeps them apart (terms.light.boundary_max_rate / raman_boundary_max_rate); the translator
+    overwrote the pump's with the Raman light's. Exact values (no tolerance). The per-class abc.type, of
+    which adept has one, is taken from the evolved classes and a difference is reported."""
+    base = (
+        "lw.enable = true;\nlw.spectral.dt = 0.002;\nlw.SRS.enable = true;\nraman.enable = true;\nraman.solver = fd;\n"
+        "laser.evolution.Labc = 1;\nraman.evolution.Labc = 1;\n"
+    )
+    cfg, report = _translate_minimal(
+        tmp_path,
+        base
+        + "laser.solver = fd;\nlaser.evolution.abc.maxDampingRate = 3000;\nraman.evolution.abc.maxDampingRate = 800;\n",
+    )
+    assert cfg["terms"]["light"]["boundary_max_rate"] == 3000.0
+    assert cfg["terms"]["light"]["raman_boundary_max_rate"] == 800.0
+    assert not any("abc" in u for u in report["unsupported"])
+    # the absorbers built from them: the same exp profile (equal Labc) scaled by 3000 and 800 /ps, so the
+    # rates are in the ratio 3.75 cell by cell (rel 1e-12; the old translator gave 1)
+    grid = _finish(cfg)["grid"]
+    rate0 = -np.log(np.asarray(grid["light_absorbing_boundaries"]))
+    rate1 = -np.log(np.asarray(grid["raman_absorbing_boundaries"]))
+    layer = rate1 > 0.0
+    assert np.any(layer)
+    np.testing.assert_allclose(rate0[layer] / rate1[layer], 3000.0 / 800.0, rtol=1e-12)
+    # a static pump's absorber type does not vote; differing evolved types are reported
+    cfg, report = _translate_minimal(
+        tmp_path, base + "laser.evolution.abc.type = exp;\nraman.evolution.abc.type = pml;\n"
+    )
+    assert cfg["terms"]["light"]["absorber"] == "pml"
+    assert not any("abc.type" in u for u in report["unsupported"])
+    _, report = _translate_minimal(tmp_path, base + "laser.solver = fd;\nraman.evolution.abc.type = pml;\n")
+    assert any("abc.type differ" in u for u in report["unsupported"])

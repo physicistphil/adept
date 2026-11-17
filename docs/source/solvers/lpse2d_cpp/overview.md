@@ -276,7 +276,7 @@ Hand-written configs that leave these unset behave differently from the first `_
 
 The deck translator reports decks it cannot represent exactly: one light solver, FD stencil order,
 `interpolate_sources` flag and beam profile for both light classes; one `abc.lambda`, one `Labc` per
-field and one anti-aliasing mask; PPM as the only FD-IAW advection scheme; no Raman resonance
+field and one anti-aliasing mask; one light absorber type (`abc.type`); PPM as the only FD-IAW advection scheme; no Raman resonance
 absorption, per-beam KAP bandwidths, Raman pulse shape or `raman.sourceTerm.lw = false`; no y-face
 beams or beams at 90 degrees. Not translated and not reported: `laser.spectral.injectorWidth`,
 `qle.theta`, `hpe.dampingRateMinFraction`.
