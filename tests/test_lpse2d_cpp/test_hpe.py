@@ -1027,7 +1027,10 @@ def test_magnetic_rotation_has_the_electron_sense_not_lpses():
 
 
 def test_out_of_plane_field_keeps_the_two_momentum_tracker():
-    """``[0, 0, B_z]`` is the float form ``B_z`` bit for bit, with (p_x, p_y) particles."""
+    """``[0, 0, B_z]`` is the float form ``B_z`` with (p_x, p_y) particles: the same load exactly, the same
+    push to round-off (rtol 1e-12). The two configurations compile to different XLA programs, and on GPU
+    their push differed in one element by 2e-16 relative in 1 of 5 runs (fusion and summation order), so
+    bit identity is not required (see "Reproducibility" in the overview)."""
     from adept._lpse2d_cpp.core.hpe import HybridParticleEvolution, load_particles
 
     cfg_f = _make_cfg_2d({"n_particles": 256, "magnetic_field": 2.0})
@@ -1045,7 +1048,8 @@ def test_out_of_plane_field_keeps_the_two_momentum_tracker():
     out_f = hpe_f.push_2d(x, y, u, zero_field, 0.0)
     out_l = hpe_l.push_2d(x, y, u, zero_field, 0.0)
     for a, b in zip(out_f, out_l, strict=True):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        b = np.asarray(b)
+        np.testing.assert_allclose(np.asarray(a), b, rtol=1e-12, atol=1e-12 * float(np.max(np.abs(b), initial=0.0)))
     # and it does rotate in the plane
     assert np.abs(np.asarray(out_f[2]) - np.asarray(u)).max() > 0.0
 

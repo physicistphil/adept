@@ -2,7 +2,10 @@
 
 The grid stays 2-D (k_z = 0), so E_z is purely transverse, never enters the EPW
 potential and never drives TPD; it is what an s-polarised beam or seed lives in. With
-E_z = 0 every solver path must reproduce the two-component code bit for bit.
+E_z = 0 every solver path must reproduce the two-component code to round-off (rtol 1e-12; E_z stays exactly
+zero). The two runs compile to different XLA programs, so they agree bit for bit only where the compiler
+happens to order the floating-point operations identically -- on macOS CPU they differ at 1e-13 after the
+run (see "Reproducibility" in the overview).
 """
 
 from copy import deepcopy
@@ -107,16 +110,22 @@ PATHS = {
 
 
 @pytest.mark.parametrize("path", list(PATHS))
-def test_three_components_with_zero_ez_are_bit_identical_to_two(path):
+def test_three_components_with_zero_ez_match_two_to_round_off(path):
     cfg = _cfg(**PATHS[path])
     two = _run(cfg, 2)
     three = _run(cfg, 3)
+
+    def close(actual, reference, what):
+        reference = np.asarray(reference)
+        atol = 1e-12 * float(np.max(np.abs(reference), initial=0.0))
+        np.testing.assert_allclose(np.asarray(actual), reference, rtol=1e-12, atol=atol, err_msg=what)
+
     for k in two:
         if k in ("E0", "E1"):
-            np.testing.assert_array_equal(three[k][..., :2], two[k], err_msg=k)
+            close(three[k][..., :2], two[k], k)
             assert np.all(three[k][..., 2] == 0.0), k
         else:
-            np.testing.assert_array_equal(three[k], two[k], err_msg=k)
+            close(three[k], two[k], k)
     assert np.any(three["E0"] != 0.0) and np.any(three["epw"] != 0.0)
 
 

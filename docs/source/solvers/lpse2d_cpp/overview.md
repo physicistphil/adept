@@ -165,6 +165,16 @@ Every save is taken at a solver step time `n * grid.dt`: `series.xr` at every st
 
 The log-scaled space-time plots are the ones to read for instability growth rates.
 
+### Reproducibility
+
+Runs are reproducible to round-off, not bit for bit. XLA compiles mathematically identical configurations
+(for example a scalar `B_z` and the vector `[0, 0, B_z]`, or two- and three-component fields with `E_z = 0`)
+into different programs whose floating-point operations may be fused or ordered differently, and on GPU
+the scatter-adds (particle histograms and deposits) use atomics whose summation order changes from run to
+run. The differences start at one unit in the last place (observed: one element of the HPE push off by
+2e-16 relative in 1 of 5 GPU runs) and grow to about 1e-13 relative over a run (macOS CPU). The tests
+compare such cases with `rtol 1e-12`; a fixed seed gives the same noise and particles, not the same bits.
+
 ## Configuration Reference
 
 See the [Configuration Reference](config.md) for complete YAML schema documentation.
